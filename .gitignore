@@ -25,6 +25,7 @@ ENV/
 .idea/
 *.swp
 *.swo
+workflows/
 
 # OS
 .DS_Store

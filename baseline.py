@@ -46,9 +46,9 @@ ENV_URL       = os.environ.get("SANSKRIT_ENV_URL", "http://localhost:7860")
 MODEL         = "llama-3.3-70b-versatile"
 TEMPERATURE   = 0.0          # deterministic — required for reproducible scores
 MAX_TOKENS    = 512
-EPISODES_PER_TASK = 5
+EPISODES_PER_TASK = 15
 RANDOM_SEED   = 42
-RETRY_WAIT    = 2            # seconds between retries on rate-limit hit
+RETRY_WAIT    = 5            # seconds between retries on rate-limit hit
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 
