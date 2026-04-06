@@ -72,7 +72,7 @@ correct linguistic interpretation from four deterministically-graded options.
 Agent ──[ManuscriptAction]──► SanskritEnv ──[ManuscriptObservation + reward]──► Agent
 ```
 
-<img width="800" alt="Sanskrit_env (2)" src="https://github.com/user-attachments/assets/6bb24e4d-4a70-4609-9114-1e043239112c" />
+<img width="800" height="" alt="Sanskrit_env (2)" src="https://github.com/user-attachments/assets/6bb24e4d-4a70-4609-9114-1e043239112c" />
 
 Four tasks, escalating difficulty:
 
