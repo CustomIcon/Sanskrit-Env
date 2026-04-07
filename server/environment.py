@@ -40,6 +40,8 @@ class SanskritEnvironment(Environment):
     def __init__(self):
         self._sessions = {} # {session_id: session_dict}
         self._active_session_id: Optional[str] = None
+        self._episode_rng = random.Random()
+        self._task_episode_cycles = {}  # {task_id: {order: [indices], cursor: int}}
         self._glossary_grader = GlossaryGrader()
         self._sandhi_grader = SandhiGrader()
         self._coherence_grader = CoherenceGrader()
@@ -73,29 +75,29 @@ class SanskritEnvironment(Environment):
                      "glossary_anchoring" | "sandhi_resolution" | "samasa_classification" | "referential_coherence"
                      Defaults to "glossary_anchoring".
         """
-        if seed is not None:
-            random.seed(seed)
+        selected_task = task_id or "glossary_anchoring"
 
         # Select episode
-        episodes = self._get_episodes_for_task(task_id or "glossary_anchoring")
-        if episode_id:
-            ep = next((e for e in episodes if e["id"] == episode_id), None)
-            if ep is None: ep = random.choice(episodes)
-        else:
-            ep = random.choice(episodes)
+        episodes = self._get_episodes_for_task(selected_task)
+        ep = self._select_episode(
+            task_id=selected_task,
+            episodes=episodes,
+            seed=seed,
+            episode_id=episode_id,
+        )
 
         session_id = episode_id or str(uuid.uuid4())
         
         # Initialize session state
         session = {
-            "task_id": task_id or "glossary_anchoring",
+            "task_id": selected_task,
             "current_episode": ep,
             "state": ManuscriptState(
                 episode_id=session_id,
                 step_count=0,
-                task_id=task_id or "glossary_anchoring",
+                task_id=selected_task,
                 passage_id=ep["id"],
-                total_decisions=self._count_total_decisions(ep, task_id),
+                total_decisions=self._count_total_decisions(ep, selected_task),
                 correct_decisions=0,
                 partial_decisions=0,
                 decision_history=[],
@@ -114,6 +116,38 @@ class SanskritEnvironment(Environment):
         self._sessions[session_id] = session
         self._active_session_id = session_id
         return self._build_initial_observation(ep, session)
+
+    def _select_episode(
+        self,
+        task_id: str,
+        episodes: list,
+        seed: Optional[int],
+        episode_id: Optional[str],
+    ) -> dict:
+        if not episodes:
+            raise ValueError(f"No episodes available for task '{task_id}'.")
+
+        if episode_id:
+            exact = next((episode for episode in episodes if episode["id"] == episode_id), None)
+            if exact is not None:
+                return exact
+
+        # Deterministic, duplicate-free traversal for sequential seeds.
+        # For a task with N episodes, seeds that differ by < N map to unique indices.
+        if seed is not None:
+            index = seed % len(episodes)
+            return episodes[index]
+
+        cycle = self._task_episode_cycles.get(task_id)
+        if cycle is None or cycle["cursor"] >= len(cycle["order"]):
+            order = list(range(len(episodes)))
+            self._episode_rng.shuffle(order)
+            cycle = {"order": order, "cursor": 0}
+            self._task_episode_cycles[task_id] = cycle
+
+        episode_index = cycle["order"][cycle["cursor"]]
+        cycle["cursor"] += 1
+        return episodes[episode_index]
 
     def _resolve_session(self, request_id: Optional[str]) -> Optional[dict]:
         """

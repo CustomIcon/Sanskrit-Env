@@ -1,5 +1,5 @@
 """
-baseline.py — SanskritEnv Baseline Inference Script (Cloudflare Workers AI + ReAct + Memory)
+baseline.py — SanskritEnv Baseline Inference Script (single Cloudflare model + HF fallback)
 
 Architecture: ReAct + Memory loop
     Think   -> agent reasons using full verse context + rolling_memory of prior decisions
@@ -7,31 +7,41 @@ Architecture: ReAct + Memory loop
     Observe -> environment returns reward + feedback_message
     Update  -> agent appends a one-line referent summary to rolling_memory
 
-LLM backend: Cloudflare Workers AI (OpenAI-compatible chat endpoint)
+Primary backend:
+    Cloudflare Workers AI model selected by BASELINE_MODEL
+
+Fallback backend:
+    Hugging Face Router model Qwen/Qwen2.5-7B-Instruct (free-tier curated list)
+    used only when Cloudflare is rate-limited.
 
 Usage:
-        # Option 1: set env vars directly
-        set CLOUDFLARE_API_TOKEN=your_cloudflare_api_token
-        set CLOUDFLARE_ACCOUNT_ID=your_cloudflare_account_id
-        set SANSKRIT_ENV_URL=http://localhost:7860
+    # Option 1: set env vars directly
+    set CLOUDFLARE_API_TOKEN=your_cloudflare_api_token
+    set CLOUDFLARE_ACCOUNT_ID=your_cloudflare_account_id
+    set HF_TOKEN=your_huggingface_token
+    set SANSKRIT_ENV_URL=http://localhost:7860
+    set BASELINE_MODEL=@cf/meta/llama-3.1-8b-instruct
 
-        # Option 2: place values in .env (loaded automatically)
-        # CLOUDFLARE_API_TOKEN=your_cloudflare_api_token
-        # CLOUDFLARE_ACCOUNT_ID=your_cloudflare_account_id
-        # SANSKRIT_ENV_URL=http://localhost:7860
+    # Option 2: place values in .env (loaded automatically)
+    # CLOUDFLARE_API_TOKEN=your_cloudflare_api_token
+    # CLOUDFLARE_ACCOUNT_ID=your_cloudflare_account_id
+    # HF_TOKEN=your_huggingface_token
+    # SANSKRIT_ENV_URL=http://localhost:7860
+    # BASELINE_MODEL=@cf/meta/llama-3.1-8b-instruct
 
-        python baseline.py
+    python baseline.py
 """
 
 import json
 import os
 import random
+import re
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
 
@@ -57,13 +67,6 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() not in {"0", "false", "no", "off"}
-
-
 def _first_nonempty_env(*names: str) -> tuple[str, Optional[str]]:
     for name in names:
         value = os.environ.get(name)
@@ -84,8 +87,6 @@ CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_ACCOUNT_ID_SOURCE = _first_nonempty_env(
     "CF_ACCOUNT_ID",
 )
 
-DEFAULT_MODEL = os.environ.get("CF_MODEL", "@cf/meta/llama-3.1-8b-instruct")
-
 _default_cf_chat_url = ""
 if CLOUDFLARE_ACCOUNT_ID:
     _default_cf_chat_url = (
@@ -98,26 +99,45 @@ CF_CHAT_COMPLETIONS_URL = (
     or _default_cf_chat_url
 )
 
-CF_MODEL_CANDIDATES = [
-    model.strip()
-    for model in os.environ.get(
-        "CF_MODEL_CANDIDATES",
-        DEFAULT_MODEL,
-    ).split(",")
-    if model.strip()
-]
-AUTO_MODEL_FALLBACK = _env_bool("CF_AUTO_MODEL_FALLBACK", True)
+BASELINE_MODEL = (
+    (os.environ.get("BASELINE_MODEL", "@cf/meta/llama-3.1-8b-instruct") or "@cf/meta/llama-3.1-8b-instruct")
+    .strip()
+    or "@cf/meta/llama-3.1-8b-instruct"
+)
 
 TEMPERATURE = _env_float("CF_TEMPERATURE", 0.0)
 MAX_TOKENS = _env_int("CF_MAX_TOKENS", 512)
-EPISODES_PER_TASK = _env_int("EPISODES_PER_TASK", 15)
-RANDOM_SEED = _env_int("RANDOM_SEED", 42)
-RETRY_WAIT = _env_int("RETRY_WAIT", 5)
 REQUEST_TIMEOUT = _env_int("CF_REQUEST_TIMEOUT", 90)
+RETRY_WAIT = _env_int("RETRY_WAIT", 5)
+
+HF_TOKEN_ENV_KEYS = (
+    "HF_TOKEN",
+    "HUGGINGFACEHUB_API_TOKEN",
+    "HUGGINGFACE_API_TOKEN",
+    "HF_API_TOKEN",
+    "HF_API_KEY",
+    "HUGGINGFACE_TOKEN",
+)
+HF_TOKEN, HF_TOKEN_SOURCE = _first_nonempty_env(*HF_TOKEN_ENV_KEYS)
+HF_ROUTER_URL = os.environ.get("HF_ROUTER_URL", "https://router.huggingface.co/v1/chat/completions")
+HF_FALLBACK_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+HF_MAX_TOKENS = _env_int("HF_MAX_TOKENS", 512)
+HF_REQUEST_TIMEOUT = _env_int("HF_REQUEST_TIMEOUT", 90)
+HF_RETRY_WAIT = _env_int("HF_RETRY_WAIT", RETRY_WAIT)
 
 BASELINE_TASK = ((os.environ.get("BASELINE_TASK", "all") or "all").strip().lower() or "all")
-BASELINE_MODEL = ((os.environ.get("BASELINE_MODEL", DEFAULT_MODEL) or DEFAULT_MODEL).strip() or DEFAULT_MODEL)
-BASELINE_NO_AUTO_FALLBACK = _env_bool("BASELINE_NO_AUTO_FALLBACK", False)
+EPISODES_PER_TASK = _env_int("EPISODES_PER_TASK", 15)
+RANDOM_SEED = _env_int("RANDOM_SEED", 42)
+
+TASK_LABELS = {
+    "glossary_anchoring": "Task 1 — Glossary Anchoring (Easy)",
+    "sandhi_resolution": "Task 2 — Sandhi Resolution (Medium)",
+    "samasa_classification": "Task 3 — Samasa Classification (Medium)",
+    "referential_coherence": "Task 4 — Referential Coherence (Hard)",
+}
+
+TASK_ORDER = list(TASK_LABELS.keys())
+HF_FALLBACK_CALLS = 0
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 
@@ -234,7 +254,7 @@ def update_rolling_memory(rolling_memory: str, obs, selected_option: str) -> str
     return "\n".join(lines)
 
 
-# ── Cloudflare Workers AI API call with retry ────────────────────────────────
+# ── Provider API calls with retry ────────────────────────────────────────────
 
 
 def _extract_chat_text(payload: dict) -> str:
@@ -267,7 +287,7 @@ def _extract_chat_text(payload: dict) -> str:
 
 
 def _is_openai_chat_endpoint(url: str) -> bool:
-    return "/ai/v1/chat/completions" in (url or "")
+    return "/chat/completions" in (url or "")
 
 
 def _build_worker_url(base_url: str, model: str) -> str:
@@ -298,6 +318,18 @@ def _build_cf_payload(model: str, system: str, user: str, max_tokens: int) -> di
     if _is_openai_chat_endpoint(CF_CHAT_COMPLETIONS_URL):
         payload["model"] = model
     return payload
+
+
+def _build_hf_payload(system: str, user: str, max_tokens: int) -> dict:
+    return {
+        "model": HF_FALLBACK_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": TEMPERATURE,
+        "max_tokens": max_tokens,
+    }
 
 
 def _parse_api_error_text(raw: str) -> str:
@@ -362,72 +394,18 @@ def _cf_headers() -> dict:
     }
 
 
-def _probe_model_access(model: str) -> tuple[bool, str]:
-    payload = _build_cf_payload(
-        model=model,
-        system="Reply with OK only.",
-        user="OK",
-        max_tokens=4,
-    )
-
-    request_body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        _build_worker_url(CF_CHAT_COMPLETIONS_URL, model),
-        data=request_body,
-        headers=_cf_headers(),
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=min(REQUEST_TIMEOUT, 30)) as response:
-            if 200 <= response.status < 300:
-                return True, "ok"
-            return False, f"HTTP {response.status}"
-    except urllib.error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="ignore")
-        parsed = _parse_api_error_text(error_body)
-        return False, f"{exc.code}: {parsed}"
-    except urllib.error.URLError as exc:
-        return False, f"network: {exc.reason}"
-    except Exception as exc:
-        return False, f"error: {exc}"
+def _hf_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json",
+    }
 
 
-def select_model_for_run(requested_model: str) -> str:
-    ordered: List[str] = [requested_model]
-    ordered.extend(m for m in CF_MODEL_CANDIDATES if m != requested_model)
-
-    print("Checking Cloudflare Workers AI model availability...")
-    unavailable = []
-
-    for model in ordered:
-        ok, detail = _probe_model_access(model)
-        if ok:
-            if model == requested_model:
-                print(f"  Using requested model: {model}")
-            else:
-                print(f"  Requested model unavailable; auto-fallback to: {model}")
-            return model
-
-        unavailable.append((model, detail))
-        print(f"  Unavailable: {model} ({detail})")
-
-        if _is_quota_exhausted(detail):
-            raise RuntimeError(
-                f"Cloudflare Workers AI quota appears exhausted for this token/account. {detail}"
-            )
-
-    summary = "; ".join(f"{model} -> {reason}" for model, reason in unavailable[:4])
-    raise RuntimeError(
-        "No available Cloudflare Workers AI chat model found for this token/account setup. "
-        f"Tried: {summary}"
-    )
+class CloudflareRateLimitError(RuntimeError):
+    pass
 
 
-def call_llm(model: str, system: str, user: str) -> str:
-    """
-    Call Cloudflare Workers AI OpenAI-compatible chat completions endpoint.
-    """
+def call_cloudflare_llm(model: str, system: str, user: str) -> str:
     payload = _build_cf_payload(
         model=model,
         system=system,
@@ -436,6 +414,8 @@ def call_llm(model: str, system: str, user: str) -> str:
     )
 
     request_body = json.dumps(payload).encode("utf-8")
+    saw_rate_limit = False
+    last_rate_error = ""
 
     for attempt in range(4):
         req = urllib.request.Request(
@@ -449,24 +429,110 @@ def call_llm(model: str, system: str, user: str) -> str:
             with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as response:
                 body = response.read().decode("utf-8")
                 data = json.loads(body)
-                return _extract_chat_text(data)
+                text = _extract_chat_text(data)
+                if text:
+                    return text
+                raise RuntimeError("Cloudflare returned empty text response.")
         except urllib.error.HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="ignore")
-            if exc.code in (429, 500, 502, 503, 504):
+            parsed = _parse_api_error_text(error_body)
+
+            if exc.code == 429 or _is_quota_exhausted(parsed):
+                saw_rate_limit = True
+                last_rate_error = f"{exc.code}: {parsed}"
+                if attempt < 3:
+                    wait = RETRY_WAIT * (2 ** attempt)
+                    print(f"    [cloudflare {exc.code}] waiting {wait}s before retry {attempt + 1}/3...")
+                    time.sleep(wait)
+                    continue
+                break
+
+            if exc.code in (500, 502, 503, 504):
+                if attempt < 3:
+                    wait = RETRY_WAIT * (2 ** attempt)
+                    print(f"    [cloudflare {exc.code}] waiting {wait}s before retry {attempt + 1}/3...")
+                    time.sleep(wait)
+                    continue
+
+            raise RuntimeError(f"Cloudflare request failed ({exc.code}): {parsed}")
+        except urllib.error.URLError as exc:
+            if attempt < 3:
                 wait = RETRY_WAIT * (2 ** attempt)
-                print(f"    [cloudflare {exc.code}] waiting {wait}s before retry {attempt + 1}/3...")
+                print(f"    [network] {exc.reason}; waiting {wait}s before retry {attempt + 1}/3...")
                 time.sleep(wait)
                 continue
-            parsed = _parse_api_error_text(error_body)
-            raise RuntimeError(f"Workers AI request failed ({exc.code}): {parsed}")
-        except urllib.error.URLError as exc:
-            wait = RETRY_WAIT * (2 ** attempt)
-            print(f"    [network] {exc.reason}; waiting {wait}s before retry {attempt + 1}/3...")
-            time.sleep(wait)
+            raise RuntimeError(f"Cloudflare network error: {exc.reason}")
         except json.JSONDecodeError as exc:
-            raise RuntimeError(f"Workers AI returned non-JSON response: {exc}")
+            raise RuntimeError(f"Cloudflare returned non-JSON response: {exc}")
 
-    return ""
+    if saw_rate_limit:
+        raise CloudflareRateLimitError(
+            "Cloudflare is rate-limited or quota-limited after retries"
+            + (f" ({last_rate_error})" if last_rate_error else "")
+        )
+
+    raise RuntimeError("Cloudflare retries exhausted.")
+
+
+def call_hf_fallback_llm(system: str, user: str) -> str:
+    if not HF_TOKEN:
+        expected = ", ".join(HF_TOKEN_ENV_KEYS)
+        raise RuntimeError(f"HF fallback unavailable. Set one of: {expected}")
+
+    payload = _build_hf_payload(system=system, user=user, max_tokens=HF_MAX_TOKENS)
+    request_body = json.dumps(payload).encode("utf-8")
+
+    for attempt in range(4):
+        req = urllib.request.Request(
+            HF_ROUTER_URL,
+            data=request_body,
+            headers=_hf_headers(),
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=HF_REQUEST_TIMEOUT) as response:
+                body = response.read().decode("utf-8")
+                data = json.loads(body)
+                text = _extract_chat_text(data)
+                if text:
+                    return text
+                raise RuntimeError("HF fallback returned empty text response.")
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="ignore")
+            parsed = _parse_api_error_text(error_body)
+            if exc.code in (429, 500, 502, 503, 504):
+                if attempt < 3:
+                    wait = HF_RETRY_WAIT * (2 ** attempt)
+                    print(f"    [hf {exc.code}] waiting {wait}s before retry {attempt + 1}/3...")
+                    time.sleep(wait)
+                    continue
+            raise RuntimeError(f"HF fallback request failed ({exc.code}): {parsed}")
+        except urllib.error.URLError as exc:
+            if attempt < 3:
+                wait = HF_RETRY_WAIT * (2 ** attempt)
+                print(f"    [hf network] {exc.reason}; waiting {wait}s before retry {attempt + 1}/3...")
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"HF fallback network error: {exc.reason}")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"HF fallback returned non-JSON response: {exc}")
+
+    raise RuntimeError("HF fallback retries exhausted.")
+
+
+def call_llm(model: str, system: str, user: str) -> str:
+    global HF_FALLBACK_CALLS
+
+    try:
+        return call_cloudflare_llm(model=model, system=system, user=user)
+    except CloudflareRateLimitError as exc:
+        if not HF_TOKEN:
+            raise RuntimeError(f"{exc}. HF fallback token is not configured.")
+
+        HF_FALLBACK_CALLS += 1
+        print(f"    [fallback] {exc}. Routing this request to HF model: {HF_FALLBACK_MODEL}")
+        return call_hf_fallback_llm(system=system, user=user)
 
 
 # ── Option matching ───────────────────────────────────────────────────────────
@@ -477,9 +543,10 @@ def match_to_option(raw_answer: str, candidate_options: list) -> str:
 
     Priority:
     1. Exact match
-    2. Candidate starts with the raw answer (model truncated)
-    3. Raw answer starts with the candidate (model added padding)
-    4. Random fallback (prevents crash, penalised by grader)
+    2. Numeric choice like `2`, `(2)`, `2.` or `option 2`
+    3. Candidate starts with the raw answer (model truncated)
+    4. Raw answer starts with the candidate (model added padding)
+    5. Random fallback (prevents crash, penalised by grader)
     """
     raw = raw_answer.strip()
 
@@ -488,24 +555,41 @@ def match_to_option(raw_answer: str, candidate_options: list) -> str:
         if raw == opt:
             return opt
 
-    # 2. Prefix: model gave first N chars of option
+    # 2. Numeric selection
+    numeric_match = re.fullmatch(
+        r"(?:option\s*)?[\[(]?([1-9]\d*)[\])\.:\-]?(?:\s+.*)?",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if numeric_match:
+        option_index = int(numeric_match.group(1)) - 1
+        if 0 <= option_index < len(candidate_options):
+            return candidate_options[option_index]
+
+    # 3. Prefix: model gave first N chars of option
     for opt in candidate_options:
         if opt.lower().startswith(raw.lower()[:30]):
             return opt
 
-    # 3. Contains: raw answer contains the option
+    # 4. Contains: raw answer contains the option
     for opt in candidate_options:
         if opt.lower() in raw.lower():
             return opt
 
-    # 4. Random fallback
+    # 5. Random fallback
     print(f"    [warn] could not match '{raw[:60]}' to any option — random fallback")
     return random.choice(candidate_options)
 
 
 # ── Episode runner (ReAct + Memory loop) ─────────────────────────────────────
 
-def run_episode(env, model: str, task_id: str, seed: int, verbose: bool = True) -> float:
+def run_episode(
+    env,
+    model: str,
+    task_id: str,
+    seed: int,
+    verbose: bool = True,
+) -> float:
     """
     Run one complete episode using the ReAct + Memory architecture.
 
@@ -556,14 +640,21 @@ def run_episode(env, model: str, task_id: str, seed: int, verbose: bool = True) 
 
 # ── Task runner ───────────────────────────────────────────────────────────────
 
-def run_task(task_id: str, label: str, model: str) -> dict:
+def run_task(
+    task_id: str,
+    label: str,
+    model: str,
+) -> dict:
     # Task 1 — glossary_anchoring  (Easy)
     # Task 2 — sandhi_resolution   (Medium)
     # Task 3 — samasa_classification (Medium)
     # Task 4 — referential_coherence (Hard)
     print(f"\n{'='*65}")
     print(f"  {label}")
-    print(f"  Model: {model} | Episodes: {EPISODES_PER_TASK} | Seed base: {RANDOM_SEED}")
+    print(
+        f"  Provider: Cloudflare Workers AI | Model: {model} | "
+        f"Episodes: {EPISODES_PER_TASK} | Seed base: {RANDOM_SEED}"
+    )
     print(f"{'='*65}")
 
     scores = []
@@ -582,7 +673,7 @@ def run_task(task_id: str, label: str, model: str) -> dict:
                     remaining = EPISODES_PER_TASK - len(scores)
                     if remaining > 0:
                         scores.extend([0.0] * remaining)
-                    print("  Stopping task early: Workers AI quota appears exhausted.")
+                    print("  Stopping task early: Cloudflare quota appears exhausted.")
                     break
 
     mean   = sum(scores) / len(scores)
@@ -592,9 +683,14 @@ def run_task(task_id: str, label: str, model: str) -> dict:
     print(f"  Std dev: {stddev:.4f}")
 
     return {
+        "provider": "cloudflare",
+        "provider_label": "Cloudflare Workers AI",
+        "fallback_provider": "huggingface",
+        "fallback_model": HF_FALLBACK_MODEL,
         "task_id":  task_id,
         "label":    label,
         "model":    model,
+        "model_spec": f"cloudflare:{model}",
         "episodes": EPISODES_PER_TASK,
         "seed":     RANDOM_SEED,
         "scores":   scores,
@@ -603,12 +699,66 @@ def run_task(task_id: str, label: str, model: str) -> dict:
     }
 
 
+def build_model_matrix(rows: List[dict]) -> List[dict]:
+    grouped: Dict[tuple[str, str], dict] = {}
+
+    for row in rows:
+        key = (row["provider"], row["model"])
+        group = grouped.setdefault(
+            key,
+            {
+                "provider": row["provider"],
+                "provider_label": row["provider_label"],
+                "model": row["model"],
+                "episodes": row["episodes"],
+                "seed": row["seed"],
+                "task_means": {},
+            },
+        )
+        group["task_means"][row["task_id"]] = row["mean"]
+
+    summary_rows = []
+    for (_, _), group in grouped.items():
+        means = [group["task_means"].get(task_id, 0.0) for task_id in TASK_ORDER]
+        overall = sum(means) / len(TASK_ORDER)
+        summary_rows.append({
+            **group,
+            "overall_mean": round(overall, 4),
+        })
+
+    summary_rows.sort(key=lambda item: (item["provider_label"], item["model"]))
+    return summary_rows
+
+
+def print_markdown_matrix(rows: List[dict]) -> None:
+    summary_rows = build_model_matrix(rows)
+    if not summary_rows:
+        return
+
+    print("README benchmark matrix:")
+    print("| Provider | Model | Episodes | Seed | Glossary | Sandhi | Samasa | Coherence | Overall |")
+    print("|----------|-------|----------|------|----------|--------|--------|-----------|---------|")
+    for row in summary_rows:
+        task_means = row["task_means"]
+        print(
+            "| {provider} | {model} | {episodes} | {seed} | {glossary:.3f} | {sandhi:.3f} | {samasa:.3f} | {coherence:.3f} | {overall:.3f} |".format(
+                provider=row["provider_label"],
+                model=row["model"],
+                episodes=row["episodes"],
+                seed=row["seed"],
+                glossary=task_means.get("glossary_anchoring", 0.0),
+                sandhi=task_means.get("sandhi_resolution", 0.0),
+                samasa=task_means.get("samasa_classification", 0.0),
+                coherence=task_means.get("referential_coherence", 0.0),
+                overall=row["overall_mean"],
+            )
+        )
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     task_choice = BASELINE_TASK
-    model_choice = BASELINE_MODEL
-    no_auto_fallback = BASELINE_NO_AUTO_FALLBACK
 
     valid_tasks = {
         "glossary_anchoring",
@@ -635,51 +785,42 @@ if __name__ == "__main__":
         print("  Set CLOUDFLARE_ACCOUNT_ID (or CF_ACCOUNT_ID), or set CF_CHAT_COMPLETIONS_URL directly.")
         sys.exit(1)
 
-    effective_model = model_choice
-    auto_fallback_enabled = AUTO_MODEL_FALLBACK and not no_auto_fallback
-    if auto_fallback_enabled:
-        try:
-            effective_model = select_model_for_run(model_choice)
-        except RuntimeError as exc:
-            print(f"ERROR: {exc}")
-            print("Hint: set BASELINE_MODEL to a supported model, e.g. @cf/meta/llama-3.1-8b-instruct")
-            sys.exit(1)
-    elif no_auto_fallback:
-        print("Model fallback disabled via BASELINE_NO_AUTO_FALLBACK=1")
-    else:
-        print("Model fallback disabled via CF_AUTO_MODEL_FALLBACK=0")
-
-    print(f"\nSanskritEnv Baseline — Cloudflare Workers AI + ReAct + Memory")
+    print("\nSanskritEnv Baseline — Single Cloudflare model + HF rate-limit fallback")
     print(f"Environment: {ENV_URL}")
-    print(f"Model:       {effective_model}")
     print(f"Task scope:  {task_choice}")
     print(f"Episodes:    {EPISODES_PER_TASK}")
     print(f"Seed base:   {RANDOM_SEED}")
+    print(f"Model:       {BASELINE_MODEL}")
     print(f"Workers URL: {CF_CHAT_COMPLETIONS_URL}")
     if CLOUDFLARE_API_TOKEN_SOURCE:
-        print(f"Token source: {CLOUDFLARE_API_TOKEN_SOURCE}")
+        print(f"Cloudflare token source: {CLOUDFLARE_API_TOKEN_SOURCE}")
     if CLOUDFLARE_ACCOUNT_ID_SOURCE:
-        print(f"Account source: {CLOUDFLARE_ACCOUNT_ID_SOURCE}")
-    print(f"Architecture: ReAct + rolling_memory (Think->Act->Observe->Update)")
+        print(f"Cloudflare account source: {CLOUDFLARE_ACCOUNT_ID_SOURCE}")
+    if HF_TOKEN:
+        print(f"HF fallback: enabled ({HF_FALLBACK_MODEL})")
+        if HF_TOKEN_SOURCE:
+            print(f"HF token source: {HF_TOKEN_SOURCE}")
+    else:
+        print("HF fallback: disabled (no HF token found)")
+    print("Architecture: ReAct + rolling_memory (Think->Act->Observe->Update)")
 
     # Canonical task ordering:
     #   Task 1 — glossary_anchoring       (Easy)
     #   Task 2 — sandhi_resolution        (Medium)
     #   Task 3 — samasa_classification    (Medium)
     #   Task 4 — referential_coherence    (Hard)
-    tasks_to_run = {
-        "glossary_anchoring":    "Task 1 — Glossary Anchoring (Easy)",
-        "sandhi_resolution":     "Task 2 — Sandhi Resolution (Medium)",
-        "samasa_classification": "Task 3 — Samasa Classification (Medium)",
-        "referential_coherence": "Task 4 — Referential Coherence (Hard)",
-    }
+    tasks_to_run = dict(TASK_LABELS)
 
     if task_choice != "all":
         tasks_to_run = {task_choice: tasks_to_run[task_choice]}
 
     results = []
     for task_id, label in tasks_to_run.items():
-        results.append(run_task(task_id, label, effective_model))
+        results.append(run_task(
+            task_id=task_id,
+            label=label,
+            model=BASELINE_MODEL,
+        ))
 
     # ── Summary table ────────────────────────────────────────────────────
     print(f"\n{'='*65}")
@@ -687,13 +828,20 @@ if __name__ == "__main__":
     print(f"{'='*65}")
     for r in results:
         bar = "█" * int(r["mean"] * 20)
-        print(f"  {r['label']}")
+        print(f"  {r['provider_label']} | {r['model']} | {r['label']}")
         print(f"    {bar:<20} {r['mean']:.4f} ± {r['stddev']:.4f}")
     print(f"{'='*65}\n")
+    print_markdown_matrix(results)
+    print()
+    if HF_FALLBACK_CALLS > 0:
+        print(f"HF fallback was used {HF_FALLBACK_CALLS} times (model: {HF_FALLBACK_MODEL}).")
+    else:
+        print("HF fallback was not used in this run.")
+    print()
 
     # ── Save results ─────────────────────────────────────────────────────
     out_path = "baseline_results.json"
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
     print(f"Results saved → {out_path}")
-    print("Copy the mean scores into README.md baseline table.")
+    print("Copy the markdown row(s) above into the README benchmark matrix.")

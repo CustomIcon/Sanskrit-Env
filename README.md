@@ -92,20 +92,20 @@ Four tasks, escalating difficulty:
 
 ---
 
-## Baseline scores
+## Baseline benchmark matrix
 
-Measured with `@cf/meta/llama-3.1-8b-instruct` (Cloudflare Workers AI),
-ReAct + Memory architecture, `CF_TEMPERATURE=0.0`, `EPISODES_PER_TASK=5`, `RANDOM_SEED=42`.
-Values below are from the generated `baseline_results.json`.
+`baseline.py` now uses a single model selector env var: `BASELINE_MODEL`.
+To compare multiple Cloudflare models, update `BASELINE_MODEL` and rerun baseline once per model.
+If Cloudflare is rate-limited, the script automatically falls back to HF Router model
+`Qwen/Qwen2.5-7B-Instruct` (from the curated free-tier list in `server/model_agent.py`).
 
-| Task | Score | Std dev | Notes |
-|------|-------|---------|-------|
-| Task 1 — Glossary Anchoring (Easy) | `1.000` | `±0.000` | Generated |
-| Task 2 — Sandhi Resolution (Medium) | `0.800` | `±0.400` | Generated |
-| Task 3 — Samāsa Classification (Medium) | `1.000` | `±0.000` | Generated |
-| Task 4 — Referential Coherence (Hard) | `0.280` | `±0.3429` | Generated |
+Current recorded run from `baseline_results.json`:
 
-*Run `python baseline.py` to reproduce. Results are saved to `baseline_results.json`.*
+| Provider | Model | Episodes | Seed | Glossary | Sandhi | Samasa | Coherence | Overall |
+|----------|-------|----------|------|----------|--------|--------|-----------|---------|
+| Cloudflare Workers AI | `@cf/meta/llama-3.1-8b-instruct` | `20` | `42` | `1.000` | `0.600` | `0.940` | `0.490` | `0.758` |
+
+*Goal: extend this matrix to five Cloudflare model rows (one run per model). Results are saved to `baseline_results.json`.*
 
 ---
 
@@ -227,8 +227,8 @@ Two runs with the same seed will always produce identical scores.
 
 - Python 3.11+
 - Docker (for containerized deployment)
-- Cloudflare Workers AI API token
-- Cloudflare account ID
+- Cloudflare Workers AI token + account ID
+- Hugging Face token (optional but recommended for automatic fallback on Cloudflare rate limits)
 
 ### Local development
 
@@ -271,18 +271,24 @@ copy .env.example .env   # Windows
 # Edit .env and set at least:
 # CLOUDFLARE_API_TOKEN=your_cloudflare_api_token
 # CLOUDFLARE_ACCOUNT_ID=your_cloudflare_account_id
+# HF_TOKEN=your_huggingface_token   # enables fallback on Cloudflare rate limits
 # SANSKRIT_ENV_URL=http://localhost:7860
 
-# All tasks
+# Select ONE Cloudflare model for this run
+# BASELINE_MODEL=@cf/meta/llama-3.1-8b-instruct
+
+# Run all tasks for the selected model
 python baseline.py
 
 # Optional controls are env-driven (no CLI flags):
 # BASELINE_TASK=samasa_classification
-# BASELINE_MODEL=@cf/meta/llama-3.1-8b-instruct
-# BASELINE_NO_AUTO_FALLBACK=1
-# EPISODES_PER_TASK=5
+# BASELINE_MODEL=@cf/meta/llama-3.2-3b-instruct
+# EPISODES_PER_TASK=20
 # RANDOM_SEED=42
 ```
+
+Run once per Cloudflare model you want to benchmark. If Cloudflare returns rate-limit errors,
+baseline automatically routes those requests to HF Router model `Qwen/Qwen2.5-7B-Instruct` when `HF_TOKEN` is set.
 
 ---
 
@@ -388,13 +394,13 @@ The included `baseline.py` implements a **ReAct + Memory** loop:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  ReAct + Memory loop (one Workers AI call per step)      │
+│  ReAct + Memory loop (one provider call per step)        │
 │                                                         │
 │  rolling_memory = ""   ← starts empty each episode     │
 │                                                         │
 │  while not done:                                        │
 │    1. THINK  — build prompt from obs + rolling_memory   │
-│    2. ACT    — call Cloudflare Workers AI, get answer   │
+│    2. ACT    — call configured provider, get answer     │
 │    3. MATCH  — match raw answer to candidate_options    │
 │    4. STEP   — env.step(ManuscriptAction(selected))     │
 │    5. UPDATE — append "Q → A" to rolling_memory        │
