@@ -103,8 +103,11 @@ Current recorded run from `baseline_results.json`:
 
 | Provider | Model | Episodes | Seed | Glossary | Sandhi | Samasa | Coherence | Overall |
 |----------|-------|----------|------|----------|--------|--------|-----------|---------|
-| Cloudflare Workers AI | `@cf/meta/llama-3.1-8b-instruct` | `20` | `42` | `1.000` | `0.600` | `0.940` | `0.490` | `0.758` |
+| Cloudflare Workers AI | @cf/meta/llama-3.1-8b-instruct | 5 | 42 | 1.000 | 1.000 | 1.000 | 0.280 | 0.820 |
+| Cloudflare Workers AI | @cf/meta/llama-3.1-70b-instruct | 5 | 42 | 1.000 | 1.000 | 1.000 | 0.700 | 0.925 |
 | Cloudflare Workers AI | @cf/meta/llama-3.2-3b-instruct | 5 | 42 | 1.000 | 0.800 | 0.480 | 0.140 | 0.605 |
+| Cloudflare Workers AI | @cf/meta/llama-3.3-70b-instruct-fp8-fast | 5 | 42 | 1.000 | 1.000 | 1.000 | 0.700 | 0.925 |
+| Cloudflare Workers AI | @cf/meta/llama-3.3-70b-instruct-fp8-fast | 20 | 42 | 1.000 | 1.000 | 0.970 | 0.700 | 0.917 |
 
 *Goal: extend this matrix to five Cloudflare model rows (one run per model). Results are saved to `baseline_results.json`.*
 
