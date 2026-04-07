@@ -86,18 +86,28 @@ if CLOUDFLARE_ACCOUNT_ID:
         f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions"
     )
 
-API_BASE_URL = (
-    os.environ.get("API_BASE_URL")
-    or os.environ.get("CF_CHAT_COMPLETIONS_URL")
-    or os.environ.get("CF_WORKERS_AI_URL")
-    or HF_ROUTER_URL
-    or DEFAULT_CF_CHAT_URL
-).strip()
+DEFAULT_HF_CHAT_URL = HF_ROUTER_URL
 
 MODEL_NAME = (
     os.environ.get("MODEL_NAME")
     or os.environ.get("BASELINE_MODEL")
     or "Qwen/Qwen2.5-72B-Instruct"
+).strip()
+
+
+def _default_api_base_url(model_name: str) -> str:
+    normalized_model = (model_name or "").strip().lower()
+
+    if normalized_model.startswith("@cf/"):
+        return DEFAULT_CF_CHAT_URL or DEFAULT_HF_CHAT_URL
+
+    return DEFAULT_HF_CHAT_URL or DEFAULT_CF_CHAT_URL
+
+API_BASE_URL = (
+    os.environ.get("API_BASE_URL")
+    or os.environ.get("CF_CHAT_COMPLETIONS_URL")
+    or os.environ.get("CF_WORKERS_AI_URL")
+    or _default_api_base_url(MODEL_NAME)
 ).strip()
 
 ENV_URL = (
@@ -114,8 +124,7 @@ TASK_NAME = (
     or "glossary_anchoring"
 ).strip().lower()
 
-if TASK_NAME == "all":
-    TASK_NAME = "glossary_anchoring"
+RUN_CURRICULUM = TASK_NAME == "all"
 
 VALID_TASKS = {
     "glossary_anchoring",
@@ -123,12 +132,25 @@ VALID_TASKS = {
     "samasa_classification",
     "referential_coherence",
 }
-if TASK_NAME not in VALID_TASKS:
+TASK_SEQUENCE = [
+    "glossary_anchoring",
+    "sandhi_resolution",
+    "samasa_classification",
+    "referential_coherence",
+]
+
+if not RUN_CURRICULUM and TASK_NAME not in VALID_TASKS:
     TASK_NAME = "glossary_anchoring"
 
 BENCHMARK_NAME = os.environ.get("BENCHMARK_NAME", "sanskrit-env")
 RANDOM_SEED = _env_int("RANDOM_SEED", 42)
 MAX_STEPS = _env_int("MAX_STEPS", 8)
+TARGET_STEPS_PER_TASK = _env_int("TARGET_STEPS_PER_TASK", 10)
+TARGET_TOTAL_STEPS = TARGET_STEPS_PER_TASK * len(TASK_SEQUENCE)
+MAX_CURRICULUM_EPISODES = _env_int(
+    "MAX_CURRICULUM_EPISODES",
+    max(32, TARGET_TOTAL_STEPS * 2),
+)
 TEMPERATURE = _env_float("TEMPERATURE", 0.0)
 MAX_TOKENS = _env_int("MAX_TOKENS", 256)
 REQUEST_TIMEOUT = _env_int("REQUEST_TIMEOUT", 90)
@@ -448,60 +470,142 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
     )
 
 
+def run_episode(
+    env,
+    task_id: str,
+    seed: int,
+    step_offset: int,
+    step_limit: int,
+) -> Tuple[int, List[float], float, bool]:
+    result = env.reset(task_id=task_id, seed=seed)
+    observation = result.observation
+    rolling_memory = ""
+    episode_steps = 0
+    episode_rewards: List[float] = []
+    effective_step_limit = max(1, min(MAX_STEPS, step_limit))
+
+    while not getattr(observation, "done", False) and episode_steps < effective_step_limit:
+        current_observation = observation
+        global_step = step_offset + episode_steps + 1
+
+        selected_option, raw_answer, model_error = choose_action(current_observation, rolling_memory)
+        rolling_memory = update_rolling_memory(rolling_memory, current_observation, selected_option)
+
+        try:
+            result = env.step(
+                ManuscriptAction(
+                    selected_option=selected_option,
+                    confidence=0.8,
+                    reasoning=raw_answer or model_error or "",
+                )
+            )
+        except Exception as exc:
+            step_error = _single_line(str(exc)) or "environment step failed"
+            log_step(global_step, selected_option, 0.0, True, step_error)
+            episode_steps += 1
+            break
+
+        observation = result.observation
+        reward = getattr(observation, "step_reward", None)
+        if reward is None:
+            reward = result.reward
+        reward = float(reward if reward is not None else 0.0)
+        episode_rewards.append(reward)
+        episode_steps += 1
+
+        done = bool(result.done or getattr(observation, "done", False))
+        step_error = _extract_step_error(observation, model_error)
+        log_step(global_step, selected_option, reward, done, step_error)
+
+        if done:
+            break
+
+    episode_score = _clamp_score(getattr(observation, "cumulative_score", 0.0))
+    if episode_score == 0.0 and getattr(result, "reward", None) is not None:
+        episode_score = _clamp_score(result.reward)
+
+    episode_success = bool(getattr(observation, "done", False)) and episode_score > 0.0
+    return episode_steps, episode_rewards, episode_score, episode_success
+
+
 def main() -> None:
     rewards: List[float] = []
     steps_taken = 0
     score = 0.0
     success = False
 
-    log_start(task=TASK_NAME, env=BENCHMARK_NAME, model=MODEL_NAME)
+    display_task_name = "all" if RUN_CURRICULUM else TASK_NAME
+    log_start(task=display_task_name, env=BENCHMARK_NAME, model=MODEL_NAME)
 
     try:
         _wait_for_env()
 
         with SanskritEnv(base_url=ENV_URL).sync() as env:
-            result = env.reset(task_id=TASK_NAME, seed=RANDOM_SEED)
-            observation = result.observation
-            rolling_memory = ""
+            if RUN_CURRICULUM:
+                task_step_counts = {task_id: 0 for task_id in TASK_SEQUENCE}
+                task_weighted_scores = {task_id: 0.0 for task_id in TASK_SEQUENCE}
+                task_score_weights = {task_id: 0 for task_id in TASK_SEQUENCE}
+                task_pointer = 0
 
-            while not getattr(observation, "done", False) and steps_taken < MAX_STEPS:
-                current_observation = observation
-                steps_taken += 1
+                for episode_index in range(MAX_CURRICULUM_EPISODES):
+                    if all(
+                        task_step_counts[task_id] >= TARGET_STEPS_PER_TASK
+                        for task_id in TASK_SEQUENCE
+                    ):
+                        break
 
-                selected_option, raw_answer, model_error = choose_action(current_observation, rolling_memory)
-                rolling_memory = update_rolling_memory(rolling_memory, current_observation, selected_option)
+                    task_id = None
+                    for _ in range(len(TASK_SEQUENCE)):
+                        candidate_task = TASK_SEQUENCE[task_pointer % len(TASK_SEQUENCE)]
+                        task_pointer += 1
+                        if task_step_counts[candidate_task] < TARGET_STEPS_PER_TASK:
+                            task_id = candidate_task
+                            break
 
-                try:
-                    result = env.step(
-                        ManuscriptAction(
-                            selected_option=selected_option,
-                            confidence=0.8,
-                            reasoning=raw_answer or model_error or "",
-                        )
+                    if task_id is None:
+                        break
+
+                    remaining_steps_for_task = TARGET_STEPS_PER_TASK - task_step_counts[task_id]
+                    episode_steps, episode_rewards, episode_score, _ = run_episode(
+                        env=env,
+                        task_id=task_id,
+                        seed=RANDOM_SEED + episode_index,
+                        step_offset=steps_taken,
+                        step_limit=remaining_steps_for_task,
                     )
-                except Exception as exc:
-                    step_error = _single_line(str(exc)) or "environment step failed"
-                    log_step(steps_taken, selected_option, 0.0, True, step_error)
-                    break
 
-                observation = result.observation
-                reward = result.reward
-                if reward is None:
-                    reward = getattr(observation, "step_reward", 0.0)
-                reward = float(reward if reward is not None else 0.0)
-                rewards.append(reward)
+                    if episode_steps <= 0:
+                        break
 
-                done = bool(result.done or getattr(observation, "done", False))
-                step_error = _extract_step_error(observation, model_error)
-                log_step(steps_taken, selected_option, reward, done, step_error)
+                    steps_taken += episode_steps
+                    rewards.extend(episode_rewards)
+                    task_step_counts[task_id] += episode_steps
+                    task_weighted_scores[task_id] += episode_score * episode_steps
+                    task_score_weights[task_id] += episode_steps
 
-                if done:
-                    break
+                task_scores = []
+                for task_id in TASK_SEQUENCE:
+                    if task_score_weights[task_id] > 0:
+                        task_scores.append(task_weighted_scores[task_id] / task_score_weights[task_id])
 
-            score = _clamp_score(getattr(observation, "cumulative_score", 0.0))
-            if score == 0.0 and getattr(result, "reward", None) is not None:
-                score = _clamp_score(result.reward)
-            success = bool(getattr(observation, "done", False)) and score > 0.0
+                if task_scores:
+                    score = _clamp_score(sum(task_scores) / len(task_scores))
+                    success = all(
+                        task_step_counts[task_id] >= TARGET_STEPS_PER_TASK
+                        for task_id in TASK_SEQUENCE
+                    ) and score > 0.0
+            else:
+                episode_steps, episode_rewards, episode_score, episode_success = run_episode(
+                    env=env,
+                    task_id=TASK_NAME,
+                    seed=RANDOM_SEED,
+                    step_offset=0,
+                    step_limit=MAX_STEPS,
+                )
+                steps_taken = episode_steps
+                rewards.extend(episode_rewards)
+                score = episode_score
+                success = episode_success
 
     except Exception as exc:
         _debug(f"inference error: {_single_line(str(exc))}")
