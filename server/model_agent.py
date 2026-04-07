@@ -2,6 +2,7 @@ import json
 import hashlib
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from typing import Any, Dict, List, Optional
@@ -117,6 +118,129 @@ def _probe_model_availability(
         return False, f"error: {exc}"
 
 
+def _models_endpoint_from_router(router_url: str) -> str:
+    parsed = urllib.parse.urlsplit((router_url or "").strip())
+    if not parsed.scheme or not parsed.netloc:
+        return "https://router.huggingface.co/v1/models"
+
+    path = parsed.path or ""
+    if path.endswith("/chat/completions"):
+        path = path[: -len("/chat/completions")] + "/models"
+    elif path.endswith("/completions"):
+        path = path[: -len("/completions")] + "/models"
+    elif path.endswith("/v1"):
+        path = path + "/models"
+    elif "/v1/" in path:
+        prefix = path.split("/v1/", 1)[0]
+        path = f"{prefix}/v1/models"
+    else:
+        path = "/v1/models"
+
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def _fetch_router_model_index(
+    hf_token: str,
+    router_url: str,
+    request_timeout: int,
+) -> List[Dict[str, Any]]:
+    models_url = _models_endpoint_from_router(router_url)
+    headers = {
+        "Authorization": f"Bearer {hf_token}",
+        "Content-Type": "application/json",
+    }
+    request = urllib.request.Request(models_url, headers=headers, method="GET")
+
+    with urllib.request.urlopen(request, timeout=request_timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        return [item for item in payload["data"] if isinstance(item, dict)]
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
+
+
+def _discover_available_models_from_router(
+    hf_token: str,
+    router_url: str,
+    request_timeout: int,
+    max_probe: int = 24,
+    max_available: int = 8,
+) -> Dict[str, Any]:
+    try:
+        index = _fetch_router_model_index(
+            hf_token=hf_token,
+            router_url=router_url,
+            request_timeout=request_timeout,
+        )
+    except Exception as exc:
+        return {
+            "models": [],
+            "unavailable_models": [
+                {
+                    "id": "router-index",
+                    "label": "router-index",
+                    "reason": f"model discovery failed: {exc}",
+                }
+            ],
+            "catalog_size": 0,
+        }
+
+    candidates: List[Dict[str, Any]] = []
+    for item in index:
+        model_id = item.get("id")
+        if not isinstance(model_id, str) or not model_id.strip():
+            continue
+
+        architecture = item.get("architecture") or {}
+        input_modalities = architecture.get("input_modalities") or []
+        output_modalities = architecture.get("output_modalities") or []
+
+        if output_modalities and "text" not in output_modalities:
+            continue
+        if input_modalities and "text" not in input_modalities:
+            continue
+
+        providers = item.get("providers") or []
+        if providers and not any((p or {}).get("status") == "live" for p in providers):
+            continue
+
+        candidates.append(item)
+
+    # More live providers usually means higher chance of successful routing.
+    candidates.sort(key=lambda entry: len((entry.get("providers") or [])), reverse=True)
+
+    available: List[Dict[str, str]] = []
+    unavailable: List[Dict[str, str]] = []
+
+    for item in candidates[:max_probe]:
+        model_id = str(item.get("id")).strip()
+        ok, reason = _probe_model_availability(
+            model_id=model_id,
+            hf_token=hf_token,
+            router_url=router_url,
+            request_timeout=request_timeout,
+        )
+
+        if ok:
+            available.append({"id": model_id, "label": model_id})
+            if len(available) >= max_available:
+                break
+        else:
+            unavailable.append({
+                "id": model_id,
+                "label": model_id,
+                "reason": reason,
+            })
+
+    return {
+        "models": available,
+        "unavailable_models": unavailable,
+        "catalog_size": len(candidates),
+    }
+
+
 def get_available_model_catalog(
     configured_models: str,
     hf_token: str,
@@ -177,7 +301,38 @@ def get_available_model_catalog(
         "unavailable_models": unavailable,
         "availability_checked": True,
         "catalog_size": len(models),
+        "discovery_used": False,
     }
+
+    # If the curated list is fully blocked, attempt live model discovery via router index.
+    if not available:
+        discovered = _discover_available_models_from_router(
+            hf_token=hf_token,
+            router_url=router_url,
+            request_timeout=safe_timeout,
+        )
+        discovered_models = discovered.get("models") or []
+        discovered_unavailable = discovered.get("unavailable_models") or []
+        discovered_catalog_size = int(discovered.get("catalog_size") or 0)
+
+        if discovered_models:
+            data = {
+                "models": discovered_models,
+                "unavailable_models": unavailable + discovered_unavailable,
+                "availability_checked": True,
+                "catalog_size": discovered_catalog_size,
+                "discovery_used": True,
+            }
+        else:
+            # Graceful fallback: keep dropdown usable even if probe checks fail for all defaults.
+            # Users can still try models manually and may succeed as provider availability changes.
+            data = {
+                "models": models,
+                "unavailable_models": unavailable + discovered_unavailable,
+                "availability_checked": False,
+                "catalog_size": len(models),
+                "discovery_used": True,
+            }
 
     _MODEL_CATALOG_CACHE[cache_key] = {"ts": now, "data": data}
     return data
