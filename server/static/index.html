@@ -308,12 +308,22 @@
       padding: 3rem 1.5rem;
       color: var(--text-faint);
     }
-    .manuscript-placeholder .om-large {
-      font-size: 4rem;
-      color: var(--border);
-      font-family: var(--font-deva);
-      margin-bottom: 0.75rem;
-      line-height: 1;
+    .manuscript-placeholder .placeholder-logo-wrap {
+      width: 70px;
+      height: 70px;
+      margin: 0 auto 0.75rem;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      opacity: 0.2;
+    }
+    .placeholder-logo {
+      width: 70px;
+      height: 70px;
+      display: block;
+      transform: scale(4.1);
+      transform-origin: 47% 46%;
     }
     .manuscript-placeholder p {
       font-size: 0.9rem;
@@ -779,7 +789,9 @@
       <!-- Manuscript Display -->
       <div class="card" id="manuscriptCard">
         <div class="manuscript-placeholder" id="manuscriptPlaceholder">
-          <div class="om-large">ॐ</div>
+          <span class="placeholder-logo-wrap">
+            <img class="placeholder-logo" src="/static/rudraksha.svg" alt="SanskritEnv logo">
+          </span>
           <p>Select a task and start a new episode to begin interpreting Sanskrit manuscripts</p>
         </div>
         <div id="manuscriptContent" style="display:none;"></div>
