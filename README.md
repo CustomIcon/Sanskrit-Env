@@ -38,10 +38,9 @@ SanskritEnv is the first RL environment built to train agents on exactly these t
 
 ---
 
-## Why this environment exists
+## How this environmen solves the problem
 
-India's **Gyan Bharatam Mission** (Union Budget 2025–26) is digitizing over
-**1 crore Sanskrit manuscripts**. Projects like eGangotri have already rescued
+Projects like eGangotri have already rescued
 and scanned more than 60,000 rare texts and 1.4 crore pages. The problem:
 digitization has outpaced translation by orders of magnitude. The bottleneck
 is not scanning technology — it is the shortage of scholars who can read
@@ -59,6 +58,8 @@ these four problems, with fully deterministic graders and dense reward signals.
 No existing OpenEnv environment addresses Sanskrit, ancient linguistics, or
 cultural heritage preservation.
 
+India's National Mission for Manuscripts has catalogued over 5.2 million manuscripts across 51 cataloguing centres; fewer than 1% have been translated into any modern language. The ratio of trained Sanskrit scholars capable of reading classical manuscripts to the volume of digitized texts is estimated at 1:10,000 and widening every year as digitization accelerates. The four linguistic layers modeled in SanskritEnv — lexical, morphological, phonological, and discourse — are the same four layers cited by Murugesh et al. (2019) "A Survey of Sanskrit NLP" as the primary obstacles to automated translation pipeline construction. SanskritEnv is the first OpenEnv environment targeting ancient-language manuscript interpretation, filling a gap that is both culturally significant and computationally underexplored.
+
 ---
 
 ## Environment overview
@@ -70,7 +71,9 @@ correct linguistic interpretation from four deterministically-graded options.
 ```
 Agent ──[ManuscriptAction]──► SanskritEnv ──[ManuscriptObservation + reward]──► Agent
 ```
-<img width="600" alt="Sanskrit_env" src="https://github.com/user-attachments/assets/bfba9fb3-1005-4e47-b469-9eff58f53f06" />
+
+<img width="600" height="" alt="Sanskrit_env" src="https://github.com/user-attachments/assets/e8837fde-589d-4e93-a5ed-9a7e2a8a5053" />
+
 
 Four tasks, escalating difficulty:
 
