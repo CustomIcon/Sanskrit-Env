@@ -17,6 +17,7 @@ import time
 from contextlib import redirect_stderr
 from io import StringIO
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import List, Optional, Tuple
 
@@ -110,12 +111,19 @@ API_BASE_URL = (
     or _default_api_base_url(MODEL_NAME)
 ).strip()
 
-ENV_URL = (
-    os.environ.get("SANSKRIT_ENV_URL")
-    or os.environ.get("ENV_URL")
-    or os.environ.get("OPENENV_BASE_URL")
-    or "http://127.0.0.1:7860"
-).rstrip("/")
+ENV_PORT = _env_int("ENV_PORT", _env_int("PORT", 7860))
+ENV_TARGET = (
+    os.environ.get("SANSKRIT_ENV_TARGET")
+    or os.environ.get("ENV_TARGET")
+    or "space"
+).strip().lower()
+if ENV_TARGET not in {"space", "local", "auto"}:
+    ENV_TARGET = "space"
+
+DEFAULT_HF_SPACE_URL = os.environ.get(
+    "DEFAULT_HF_SPACE_URL",
+    "https://adityahars-sanskrit-env.hf.space",
+).strip()
 
 TASK_NAME = (
     os.environ.get("TASK_NAME")
@@ -259,21 +267,30 @@ def _llm_headers() -> dict:
     return headers
 
 
-def _wait_for_env() -> None:
-    health_url = f"{ENV_URL}/health"
-    last_error = ""
+def _normalize_env_url(raw_url: Optional[str]) -> str:
+    value = _single_line(raw_url).rstrip("/")
+    if not value:
+        return ""
 
-    for attempt in range(ENV_STARTUP_RETRIES):
-        try:
-            with urllib.request.urlopen(health_url, timeout=10) as response:
-                if 200 <= getattr(response, "status", 200) < 500:
-                    return
-        except Exception as exc:
-            last_error = _single_line(str(exc))
-            if attempt < ENV_STARTUP_RETRIES - 1:
-                time.sleep(ENV_STARTUP_WAIT)
+    lowered = value.lower()
+    if "huggingface.co/spaces/" in lowered:
+        parsed = urllib.parse.urlparse(value)
+        path_parts = [part for part in parsed.path.split("/") if part]
+        if len(path_parts) >= 3 and path_parts[0].lower() == "spaces":
+            owner = path_parts[1].lower()
+            space_name = path_parts[2].lower()
+            return f"https://{owner}-{space_name}.hf.space"
 
-    raise RuntimeError(f"environment not reachable at {health_url}: {last_error or 'unknown error'}")
+    if not re.match(r"^[a-z][a-z0-9+.-]*://", value, flags=re.IGNORECASE):
+        if value.endswith(".hf.space"):
+            return f"https://{value}"
+        if value.startswith("localhost") or value.startswith("127.0.0.1"):
+            return f"http://{value}"
+        if re.match(r"^\d+\.\d+\.\d+\.\d+(?::\d+)?$", value):
+            return f"http://{value}"
+        return f"https://{value}"
+
+    return value
 
 
 def build_user_prompt(obs, rolling_memory: str) -> str:
@@ -384,6 +401,127 @@ def call_llm(system_prompt: str, user_prompt: str) -> str:
             raise RuntimeError(f"model returned non-JSON response: {exc}")
 
     raise RuntimeError("model retries exhausted")
+
+
+def _hf_space_url_from_id(raw_space_id: Optional[str]) -> str:
+    value = _single_line(raw_space_id)
+    if not value:
+        return ""
+
+    if re.match(r"^[a-z][a-z0-9+.-]*://", value, flags=re.IGNORECASE):
+        return value
+
+    if "/" not in value:
+        return ""
+
+    owner, space_name = (part.strip().lower() for part in value.split("/", 1))
+    if not owner or not space_name:
+        return ""
+
+    return f"https://{owner}-{space_name}.hf.space"
+
+
+def _is_local_env_url(base_url: str) -> bool:
+    try:
+        hostname = (urllib.parse.urlparse(base_url).hostname or "").lower()
+    except ValueError:
+        return False
+
+    return hostname in {"localhost", "127.0.0.1", "::1"}
+
+
+def _normalized_env_urls(raw_candidates: List[Optional[str]]) -> List[str]:
+    candidates: List[str] = []
+    for raw_candidate in raw_candidates:
+        normalized = _normalize_env_url(raw_candidate)
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+    return candidates
+
+
+def _build_env_url_candidates() -> List[str]:
+    explicit_space_candidates = _normalized_env_urls(
+        [
+            os.environ.get("HF_SPACE_URL"),
+            os.environ.get("SPACE_URL"),
+            os.environ.get("SPACE_HOST"),
+            _hf_space_url_from_id(os.environ.get("HF_SPACE_ID") or os.environ.get("SPACE_ID")),
+        ]
+    )
+
+    configured_candidates = _normalized_env_urls(
+        [
+            os.environ.get("SANSKRIT_ENV_URL"),
+            os.environ.get("ENV_URL"),
+            os.environ.get("OPENENV_BASE_URL"),
+        ]
+    )
+
+    configured_space_candidates = [
+        base_url for base_url in configured_candidates if not _is_local_env_url(base_url)
+    ]
+    configured_local_candidates = [
+        base_url for base_url in configured_candidates if _is_local_env_url(base_url)
+    ]
+
+    default_space_candidates = _normalized_env_urls([DEFAULT_HF_SPACE_URL])
+    default_local_candidates = _normalized_env_urls(
+        [
+            f"http://127.0.0.1:{ENV_PORT}",
+            f"http://localhost:{ENV_PORT}",
+        ]
+    )
+
+    if ENV_TARGET == "local":
+        return _normalized_env_urls(
+            configured_local_candidates
+            + default_local_candidates
+            + explicit_space_candidates
+            + configured_space_candidates
+            + default_space_candidates
+        )
+
+    if ENV_TARGET == "auto":
+        return _normalized_env_urls(
+            configured_candidates
+            + explicit_space_candidates
+            + default_space_candidates
+            + default_local_candidates
+        )
+
+    return _normalized_env_urls(
+        explicit_space_candidates
+        + configured_space_candidates
+        + default_space_candidates
+        + configured_local_candidates
+        + default_local_candidates
+    )
+
+
+def _wait_for_env() -> str:
+    candidates = _build_env_url_candidates()
+    last_errors = {}
+
+    for attempt in range(ENV_STARTUP_RETRIES):
+        for base_url in candidates:
+            health_url = f"{base_url}/health"
+            try:
+                with urllib.request.urlopen(health_url, timeout=10) as response:
+                    if 200 <= getattr(response, "status", 200) < 500:
+                        return base_url
+            except Exception as exc:
+                last_errors[base_url] = _single_line(str(exc)) or "unknown error"
+
+        if attempt < ENV_STARTUP_RETRIES - 1:
+            time.sleep(ENV_STARTUP_WAIT)
+
+    error_summary = "; ".join(
+        f"{base_url}/health -> {error}"
+        for base_url, error in last_errors.items()
+    )
+    raise RuntimeError(
+        f"environment not reachable via configured URLs: {error_summary or 'unknown error'}"
+    )
 
 
 def match_to_option(raw_answer: str, candidate_options: List[str]) -> str:
@@ -533,14 +671,16 @@ def main() -> None:
     steps_taken = 0
     score = 0.0
     success = False
+    env_url = ""
 
     display_task_name = "all" if RUN_CURRICULUM else TASK_NAME
     log_start(task=display_task_name, env=BENCHMARK_NAME, model=MODEL_NAME)
 
     try:
-        _wait_for_env()
+        env_url = _wait_for_env()
+        _debug(f"environment url: {env_url}")
 
-        with SanskritEnv(base_url=ENV_URL).sync() as env:
+        with SanskritEnv(base_url=env_url).sync() as env:
             if RUN_CURRICULUM:
                 task_step_counts = {task_id: 0 for task_id in TASK_SEQUENCE}
                 task_weighted_scores = {task_id: 0.0 for task_id in TASK_SEQUENCE}

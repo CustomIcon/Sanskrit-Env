@@ -18,7 +18,7 @@ huggingFace-url: https://huggingface.co/spaces/Adityahars/Sanskrit-env
 > projects backed by the Indian government.
 
 [![openenv](https://img.shields.io/badge/openenv-compatible-blue?logo=huggingface)](https://github.com/meta-pytorch/OpenEnv)
-[![HF Space](https://img.shields.io/badge/HuggingFace-Space-yellow?logo=huggingface)](https://huggingface.co/spaces/Aditya_Raj/sanskrit-env)
+[![HF Space](https://img.shields.io/badge/HuggingFace-Space-yellow?logo=huggingface)](https://huggingface.co/spaces/Adityahars/Sanskrit-env)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://python.org)
 
@@ -216,11 +216,21 @@ Two runs with the same seed will always produce identical scores.
 git clone https://huggingface.co/spaces/Adityahars/Sanskrit-env
 cd sanskrit-env
 
-# Install
-pip install -r requirements.txt
+# Create a local virtual environment
+python -m venv .venv
+
+# Activate it
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+# macOS/Linux
+# source .venv/bin/activate
+
+# Install all required modules
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 
 # Run environment server
-uvicorn server.app:app --host 0.0.0.0 --port 7860 --reload
+python -m uvicorn server.app:app --host 0.0.0.0 --port 7860 --reload
 
 # Validate (separate terminal)
 openenv validate --url http://localhost:7860
@@ -229,11 +239,16 @@ openenv validate --url http://localhost:7860
 ### Docker
 
 ```bash
-# Build
-docker build -t sanskrit-env:latest .
+# Build a local image
+docker build -t sanskrit-env:local .
+
+# The image creates /opt/venv and installs requirements there during build
 
 # Run
-docker run -p 7860:7860 sanskrit-env:latest
+docker run --rm -p 7860:7860 sanskrit-env:local
+
+# Optional: verify installed modules inside the container
+docker run --rm --entrypoint python sanskrit-env:local -m pip list
 
 # Health check
 curl http://localhost:7860/health
@@ -244,7 +259,15 @@ curl http://localhost:7860/health
 
 ```bash
 export GROQ_API_KEY=your_key_here
-export SANSKRIT_ENV_URL=http://localhost:7860
+export SANSKRIT_ENV_TARGET=space
+export HF_SPACE_URL=https://adityahars-sanskrit-env.hf.space
+
+# To force local instead, flip the target and point at localhost
+# export SANSKRIT_ENV_TARGET=local
+# export SANSKRIT_ENV_URL=http://localhost:7860
+
+# The script also accepts the Hugging Face page URL form and normalizes it:
+# export HF_SPACE_URL=https://huggingface.co/spaces/Adityahars/Sanskrit-env
 
 # All tasks
 python baseline.py
@@ -324,7 +347,7 @@ If you use SanskritEnv in your research:-
   title   = {SanskritEnv: A Reinforcement Learning Environment for Sanskrit Manuscript Interpretation},
   author  = {Meta_Mesh},
   year    = {2026},
-  url     = {https://huggingface.co/spaces/Aditya_Raj/sanskrit-env},
+  url     = {https://huggingface.co/spaces/Adityahars/Sanskrit-env},
   note    = {OpenEnv-compatible environment for structured linguistic ambiguity resolution}
 }
 ```
