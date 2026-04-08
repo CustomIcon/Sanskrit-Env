@@ -16,9 +16,9 @@ class CoherenceGrader:
     """
     Grades ManuscriptAction for Task 3 (Referential Coherence).
 
-    The main question is worth 0.70 of the episode score.
+    The main question is worth 0.70 of the raw episode credit.
     Each consistency checkpoint correctly answered is worth 0.10 (up to 0.30).
-    Total episode score is normalized to 0.0–1.0.
+    The environment maps this raw credit onto its emitted reward scale.
 
     Main question scoring:
     - Correct antecedent: 0.70
@@ -88,10 +88,10 @@ class CoherenceGrader:
         checkpoint_rewards: List[float],
     ) -> float:
         """
-        Compute normalized final episode score.
+        Compute raw episode credit before the environment maps it to the emitted reward scale.
 
         Max possible = 0.70 (final) + 0.10 * num_checkpoints
-        Normalized to 0.0–1.0.
+        Returned as raw credit in the 0.0–1.0 range.
         """
         total = final_reward + sum(checkpoint_rewards)
         max_possible = self.MAIN_CORRECT + self.CHECKPOINT_CORRECT * len(checkpoint_rewards)

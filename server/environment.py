@@ -55,9 +55,9 @@ class SanskritEnvironment(Environment):
         self._task3_data = self._load_json("task3_coherence.json")
         self._task4_data = self._load_json("task4_samasa.json")
 
-    def _shape_episode_score(self, raw_score: float) -> float:
-        normalized = min(max(float(raw_score), 0.0), 1.0)
-        shaped = self.MIN_EPISODE_SCORE + normalized * (
+    def _shape_reward_signal(self, raw_score: float) -> float:
+        bounded = min(max(float(raw_score), 0.0), 1.0)
+        shaped = self.MIN_EPISODE_SCORE + bounded * (
             self.MAX_EPISODE_SCORE - self.MIN_EPISODE_SCORE
         )
         return round(min(max(shaped, self.MIN_EPISODE_SCORE), self.MAX_EPISODE_SCORE), 4)
@@ -227,34 +227,31 @@ class SanskritEnvironment(Environment):
     # ─────────────────────────────────────────────────────────────
 
     def _step_task1(self, action: ManuscriptAction, ep: dict, session: dict) -> ManuscriptObservation:
-        reward, feedback = self._glossary_grader.grade(
+        raw_reward, feedback = self._glossary_grader.grade(
             selected_option=action.selected_option,
             correct_answer=ep["correct_answer"],
             candidate_options=ep["candidate_options"],
             partial_credit_indices=ep["partial_credit_indices"],
         )
+        step_reward = self._shape_reward_signal(raw_reward)
 
         state = session["state"]
         task_id = session["task_id"]
 
-        is_correct = reward == 1.0
-        is_partial = 0.0 < reward < 1.0
+        is_correct = raw_reward == 1.0
+        is_partial = 0.0 < raw_reward < 1.0
         state.correct_decisions += int(is_correct)
         state.partial_decisions += int(is_partial)
         state.decision_history.append({
             "step": state.step_count,
             "selected": action.selected_option,
             "correct": ep["correct_answer"],
-            "reward": reward,
+            "raw_reward": raw_reward,
+            "reward": step_reward,
         })
         state.is_complete = True
 
-        final_score = self._normalize_score(
-            state.correct_decisions,
-            state.partial_decisions,
-            state.total_decisions,
-            task_id="glossary_anchoring",
-        )
+        final_score = step_reward
 
         return ManuscriptObservation(
             task_id=task_id,
@@ -267,7 +264,7 @@ class SanskritEnvironment(Environment):
             active_glossary={ep["target_term_iast"]: "See candidate options"},
             decision_prompt=ep["decision_prompt"],
             candidate_options=ep["candidate_options"],
-            step_reward=reward,
+            step_reward=step_reward,
             cumulative_score=final_score,
             feedback_message=feedback,
             done=True,
@@ -279,34 +276,31 @@ class SanskritEnvironment(Environment):
     # ─────────────────────────────────────────────────────────────
 
     def _step_task2(self, action: ManuscriptAction, ep: dict, session: dict) -> ManuscriptObservation:
-        reward, feedback = self._sandhi_grader.grade(
+        raw_reward, feedback = self._sandhi_grader.grade(
             selected_option=action.selected_option,
             correct_answer=ep["correct_answer"],
             candidate_options=ep["candidate_options"],
             partial_credit_indices=ep["partial_credit_indices"],
         )
+        step_reward = self._shape_reward_signal(raw_reward)
 
         state = session["state"]
         task_id = session["task_id"]
 
-        is_correct = reward == 1.0
-        is_partial = 0.0 < reward < 1.0
+        is_correct = raw_reward == 1.0
+        is_partial = 0.0 < raw_reward < 1.0
         state.correct_decisions += int(is_correct)
         state.partial_decisions += int(is_partial)
         state.decision_history.append({
             "step": state.step_count,
             "selected": action.selected_option,
             "correct": ep["correct_answer"],
-            "reward": reward,
+            "raw_reward": raw_reward,
+            "reward": step_reward,
         })
         state.is_complete = True
 
-        final_score = self._normalize_score(
-            state.correct_decisions,
-            state.partial_decisions,
-            state.total_decisions,
-            task_id="sandhi_resolution",
-        )
+        final_score = step_reward
 
         return ManuscriptObservation(
             task_id=task_id,
@@ -318,7 +312,7 @@ class SanskritEnvironment(Environment):
             compound_iast=ep["compound_iast"],
             decision_prompt=ep["decision_prompt"],
             candidate_options=ep["candidate_options"],
-            step_reward=reward,
+            step_reward=step_reward,
             cumulative_score=final_score,
             feedback_message=feedback,
             done=True,
@@ -339,13 +333,14 @@ class SanskritEnvironment(Environment):
             cp = checkpoints[session["t3_checkpoint_index"]]
             cp_candidates = self._get_checkpoint_candidates(cp["answer"], ep)
 
-            cp_reward, cp_feedback = self._coherence_grader.grade_checkpoint(
+            raw_checkpoint_reward, cp_feedback = self._coherence_grader.grade_checkpoint(
                 selected_option=action.selected_option,
                 correct_answer=cp["answer"],
                 candidate_options=cp_candidates,
             )
-            session["t3_checkpoint_rewards"].append(cp_reward)
+            session["t3_checkpoint_rewards"].append(raw_checkpoint_reward)
             session["t3_checkpoint_index"] += 1
+            checkpoint_reward = self._shape_reward_signal(raw_checkpoint_reward)
 
             # Update consistency map
             state.consistency_map[cp["question"]] = action.selected_option
@@ -383,8 +378,8 @@ class SanskritEnvironment(Environment):
                 current_verse_num=session["t3_verse_index"],
                 decision_prompt=next_prompt,
                 candidate_options=next_candidates,
-                step_reward=cp_reward,
-                cumulative_score=self._compute_t3_partial_score(session),
+                step_reward=checkpoint_reward,
+                cumulative_score=self._compute_t3_cumulative_score(session),
                 feedback_message=cp_feedback,
                 consistency_history=[
                     {"question": q, "answer": a}
@@ -396,25 +391,27 @@ class SanskritEnvironment(Environment):
 
         else:
             # Final referential question
-            final_reward, final_feedback = self._coherence_grader.grade_final(
+            raw_final_reward, final_feedback = self._coherence_grader.grade_final(
                 selected_option=action.selected_option,
                 correct_answer=ep["correct_answer"],
                 candidate_options=ep["candidate_options"],
             )
+            step_reward = self._shape_reward_signal(raw_final_reward)
 
             raw_episode_score = self._coherence_grader.compute_episode_score(
-                final_reward=final_reward,
+                final_reward=raw_final_reward,
                 checkpoint_rewards=session["t3_checkpoint_rewards"],
             )
-            episode_score = self._shape_episode_score(raw_episode_score)
+            episode_score = self._shape_reward_signal(raw_episode_score)
 
-            state.correct_decisions += int(final_reward > 0)
+            state.correct_decisions += int(raw_final_reward > 0)
             state.is_complete = True
             state.decision_history.append({
                 "step": state.step_count,
                 "selected": action.selected_option,
                 "correct": ep["correct_answer"],
-                "reward": final_reward,
+                "raw_reward": raw_final_reward,
+                "reward": step_reward,
                 "episode_score": episode_score,
             })
 
@@ -433,7 +430,7 @@ class SanskritEnvironment(Environment):
                 current_verse_num=len(all_verses),
                 decision_prompt=ep["referential_question"],
                 candidate_options=ep["candidate_options"],
-                step_reward=final_reward,
+                step_reward=step_reward,
                 cumulative_score=episode_score,
                 feedback_message=final_feedback,
                 consistency_history=[
@@ -450,34 +447,31 @@ class SanskritEnvironment(Environment):
     # ─────────────────────────────────────────────────────────────
 
     def _step_task4(self, action: ManuscriptAction, ep: dict, session: dict) -> ManuscriptObservation:
-        reward, feedback = self._samasa_grader.grade(
+        raw_reward, feedback = self._samasa_grader.grade(
             selected_option=action.selected_option,
             correct_answer=ep["correct_answer"],
             candidate_options=ep["candidate_options"],
             partial_credit_indices=ep["partial_credit_indices"],
         )
+        step_reward = self._shape_reward_signal(raw_reward)
 
         state = session["state"]
         task_id = session["task_id"]
 
-        is_correct = reward == 1.0
-        is_partial = 0.0 < reward < 1.0
+        is_correct = raw_reward == 1.0
+        is_partial = 0.0 < raw_reward < 1.0
         state.correct_decisions += int(is_correct)
         state.partial_decisions += int(is_partial)
         state.decision_history.append({
             "step": state.step_count,
             "selected": action.selected_option,
             "correct": ep["correct_answer"],
-            "reward": reward,
+            "raw_reward": raw_reward,
+            "reward": step_reward,
         })
         state.is_complete = True
 
-        final_score = self._normalize_score(
-            state.correct_decisions,
-            state.partial_decisions,
-            state.total_decisions,
-            task_id="samasa_classification",
-        )
+        final_score = step_reward
 
         return ManuscriptObservation(
             task_id=task_id,
@@ -489,7 +483,7 @@ class SanskritEnvironment(Environment):
             compound_iast=ep.get("compound_iast"),
             decision_prompt=ep["decision_prompt"],
             candidate_options=ep["candidate_options"],
-            step_reward=reward,
+            step_reward=step_reward,
             cumulative_score=final_score,
             feedback_message=feedback,
             done=True,
@@ -602,29 +596,12 @@ class SanskritEnvironment(Environment):
         random.shuffle(candidates)
         return candidates[:4]
 
-    def _normalize_score(
-        self,
-        correct: int,
-        partial: int,
-        total: int,
-        task_id: str,
-    ) -> float:
-        if total == 0:
-            return 0.0
-        if task_id == "glossary_anchoring":
-            raw = correct * 1.0 + partial * 0.4
-            return self._shape_episode_score(min(raw / total, 1.0))
-        elif task_id == "sandhi_resolution":
-            raw = correct * 1.0 + partial * 0.25
-            return self._shape_episode_score(min(raw / total, 1.0))
-        elif task_id == "samasa_classification":
-            raw = correct * 1.0 + partial * 0.4
-            return self._shape_episode_score(min(raw / total, 1.0))
-        return self._shape_episode_score(min(correct / total, 1.0))
-
-    def _compute_t3_partial_score(self, session: dict) -> float:
-        cp_score = sum(session["t3_checkpoint_rewards"])
-        max_cp = self._coherence_grader.CHECKPOINT_CORRECT * len(session["t3_checkpoint_rewards"])
-        if max_cp == 0:
-            return 0.0
-        return round(min(cp_score / (max_cp + self._coherence_grader.MAIN_CORRECT), 1.0), 4)
+    def _compute_t3_cumulative_score(self, session: dict) -> float:
+        raw_checkpoint_credit = sum(session["t3_checkpoint_rewards"])
+        max_possible_credit = (
+            self._coherence_grader.MAIN_CORRECT
+            + self._coherence_grader.CHECKPOINT_CORRECT * len(session["t3_checkpoint_rewards"])
+        )
+        if max_possible_credit == 0:
+            return self.MIN_EPISODE_SCORE
+        return self._shape_reward_signal(min(raw_checkpoint_credit / max_possible_credit, 1.0))

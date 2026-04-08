@@ -87,10 +87,10 @@ class ManuscriptObservation(Observation):
 
     # Feedback
     step_reward: float = 0.0
-    """Reward earned on the immediately preceding step. 0.0 on first step."""
+    """Reward emitted by the immediately preceding environment step. 0.0 before any action is taken."""
 
     cumulative_score: float = 0.0
-    """Running normalized score for this episode so far."""
+    """Current episode score on the environment's emitted reward scale."""
 
     feedback_message: str = ""
     """Human-readable explanation of the previous step's reward."""
