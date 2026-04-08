@@ -283,15 +283,16 @@ export HF_TOKEN=your_huggingface_token
 export API_BASE_URL=https://router.huggingface.co/v1
 export MODEL_NAME=Qwen/Qwen2.5-72B-Instruct
 
-# Optional: use this only when launching the env from a local Docker image.
+# Optional: use this when connecting to a manually started local Docker env.
 # export LOCAL_IMAGE_NAME=sanskrit-env:local
+# export SANSKRIT_ENV_URL=http://localhost:7860
 
 python inference.py
 ```
 
 `inference.py` defaults to the deployed HF Space for the environment connection.
-If `LOCAL_IMAGE_NAME` is set, it uses `SanskritEnv.from_docker_image(...)` instead.
-Each run evaluates 15 episodes for each of the four SanskritEnv tasks.
+If `LOCAL_IMAGE_NAME` is set, it expects a local environment to already be running at `SANSKRIT_ENV_URL` (default `http://localhost:7860`).
+Each run evaluates the configured number of episodes for each SanskritEnv task.
 Stdout is emitted as four separate START/STEP/END sections, one per task, and the END scores come directly from the environment's 0.50-0.95 scoring logic.
 
 ---

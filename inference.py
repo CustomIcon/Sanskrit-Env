@@ -32,6 +32,7 @@ HF_TOKEN = (os.getenv("HF_TOKEN") or "").strip()
 API_BASE_URL = (os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1").strip()
 MODEL_NAME = (os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct").strip()
 LOCAL_IMAGE_NAME = (os.getenv("LOCAL_IMAGE_NAME") or "").strip()
+LOCAL_BASE_URL = (os.getenv("SANSKRIT_ENV_URL") or "http://localhost:7860").strip()
 
 BENCHMARK = "sanskrit-env"
 SPACE_BASE_URL = "https://adityahars-sanskrit-env.hf.space"
@@ -287,7 +288,15 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
 
 async def create_env() -> SanskritEnv:
     if LOCAL_IMAGE_NAME:
-        return await SanskritEnv.from_docker_image(LOCAL_IMAGE_NAME)
+        env = SanskritEnv(base_url=LOCAL_BASE_URL)
+        try:
+            await env.connect()
+            return env
+        except Exception as exc:
+            raise RuntimeError(
+                f"LOCAL_IMAGE_NAME is set, but no local environment is reachable at {LOCAL_BASE_URL}. "
+                f"Start it manually with: docker run --rm -p 7860:7860 {LOCAL_IMAGE_NAME}"
+            ) from exc
 
     env = SanskritEnv(base_url=SPACE_BASE_URL)
     await env.connect()
