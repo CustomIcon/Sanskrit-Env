@@ -1,27 +1,22 @@
 """
 Submission-safe inference script for SanskritEnv.
 
-This script is intentionally narrow:
-- Runs a single episode for a single task.
-- Emits only [START], [STEP], and [END] lines to stdout.
-- Sends diagnostics to stderr.
-- Handles network, parsing, and environment failures without crashing.
+This script runs a single episode for a single task, emits only [START],
+[STEP], and [END] lines to stdout, and uses the OpenAI client for all LLM
+calls as required by the submission format.
 """
 
-import json
+import asyncio
 import logging
 import os
 import re
 import sys
-import time
 from contextlib import redirect_stderr
 from io import StringIO
-import urllib.error
-import urllib.parse
-import urllib.request
 from typing import List, Optional, Tuple
 
 from dotenv import load_dotenv
+from openai import OpenAI
 
 from client import SanskritEnv
 from models import ManuscriptAction
@@ -33,144 +28,38 @@ with redirect_stderr(StringIO()):
     load_dotenv()
 
 
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, default))
-    except (TypeError, ValueError):
-        return default
+HF_TOKEN = (os.getenv("HF_TOKEN") or "").strip()
+API_BASE_URL = (os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1").strip()
+MODEL_NAME = (os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct").strip()
+LOCAL_IMAGE_NAME = (os.getenv("LOCAL_IMAGE_NAME") or "").strip()
 
+BENCHMARK = "sanskrit-env"
+SPACE_BASE_URL = "https://adityahars-sanskrit-env.hf.space"
+RANDOM_SEED = 42
+TEMPERATURE = 0.0
+MAX_TOKENS = 256
+REQUEST_TIMEOUT = 90
+EPISODES_PER_TASK = 15
 
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, default))
-    except (TypeError, ValueError):
-        return default
-
-
-def _first_nonempty_env(*names: str) -> Tuple[str, Optional[str]]:
-    for name in names:
-        value = os.environ.get(name)
-        if value and value.strip():
-            normalized = value.strip().strip('"').strip("'")
-            if normalized.lower().startswith("bearer "):
-                normalized = normalized[7:].strip()
-            return normalized, name
-    return "", None
-
-
-HF_TOKEN_ENV_KEYS = (
-    "HF_TOKEN",
-    "HUGGINGFACEHUB_API_TOKEN",
-    "HUGGINGFACE_API_TOKEN",
-    "HF_API_TOKEN",
-    "HF_API_KEY",
-    "HUGGINGFACE_TOKEN",
-    "API_KEY",
-)
-
-CLOUDFLARE_TOKEN_ENV_KEYS = (
-    "CLOUDFLARE_API_TOKEN",
-    "CF_API_TOKEN",
-    "CLOUDFLARE_TOKEN",
-    "CF_TOKEN",
-)
-
-HF_TOKEN, _ = _first_nonempty_env(*HF_TOKEN_ENV_KEYS)
-CLOUDFLARE_API_TOKEN, _ = _first_nonempty_env(*CLOUDFLARE_TOKEN_ENV_KEYS)
-CLOUDFLARE_ACCOUNT_ID, _ = _first_nonempty_env("CLOUDFLARE_ACCOUNT_ID", "CF_ACCOUNT_ID")
-
-HF_ROUTER_URL = os.environ.get("HF_ROUTER_URL", "https://router.huggingface.co/v1/chat/completions")
-
-DEFAULT_CF_CHAT_URL = ""
-if CLOUDFLARE_ACCOUNT_ID:
-    DEFAULT_CF_CHAT_URL = (
-        f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions"
-    )
-
-DEFAULT_HF_CHAT_URL = HF_ROUTER_URL
-
-MODEL_NAME = (
-    os.environ.get("MODEL_NAME")
-    or os.environ.get("BASELINE_MODEL")
-    or "Qwen/Qwen2.5-72B-Instruct"
-).strip()
-
-
-def _default_api_base_url(model_name: str) -> str:
-    normalized_model = (model_name or "").strip().lower()
-
-    if normalized_model.startswith("@cf/"):
-        return DEFAULT_CF_CHAT_URL or DEFAULT_HF_CHAT_URL
-
-    return DEFAULT_HF_CHAT_URL or DEFAULT_CF_CHAT_URL
-
-API_BASE_URL = (
-    os.environ.get("API_BASE_URL")
-    or os.environ.get("CF_CHAT_COMPLETIONS_URL")
-    or os.environ.get("CF_WORKERS_AI_URL")
-    or _default_api_base_url(MODEL_NAME)
-).strip()
-
-ENV_PORT = _env_int("ENV_PORT", _env_int("PORT", 7860))
-ENV_TARGET = (
-    os.environ.get("SANSKRIT_ENV_TARGET")
-    or os.environ.get("ENV_TARGET")
-    or "space"
-).strip().lower()
-if ENV_TARGET not in {"space", "local", "auto"}:
-    ENV_TARGET = "space"
-
-DEFAULT_HF_SPACE_URL = os.environ.get(
-    "DEFAULT_HF_SPACE_URL",
-    "https://adityahars-sanskrit-env.hf.space",
-).strip()
-
-TASK_NAME = (
-    os.environ.get("TASK_NAME")
-    or os.environ.get("OPENENV_TASK")
-    or os.environ.get("BASELINE_TASK")
-    or "glossary_anchoring"
-).strip().lower()
-
-RUN_CURRICULUM = TASK_NAME == "all"
-
-VALID_TASKS = {
-    "glossary_anchoring",
-    "sandhi_resolution",
-    "samasa_classification",
-    "referential_coherence",
-}
 TASK_SEQUENCE = [
     "glossary_anchoring",
     "sandhi_resolution",
     "samasa_classification",
     "referential_coherence",
 ]
-
-if not RUN_CURRICULUM and TASK_NAME not in VALID_TASKS:
-    TASK_NAME = "glossary_anchoring"
-
-BENCHMARK_NAME = os.environ.get("BENCHMARK_NAME", "sanskrit-env")
-RANDOM_SEED = _env_int("RANDOM_SEED", 42)
-MAX_STEPS = _env_int("MAX_STEPS", 8)
-TASK_MAX_STEPS = {
+VALID_TASKS = set(TASK_SEQUENCE)
+TASK_LABELS = {
+    "glossary_anchoring": "glossary anchoring (easy)",
+    "sandhi_resolution": "sandhi resolution (medium)",
+    "samasa_classification": "samasa classification (medium)",
+    "referential_coherence": "referential coherence (hard)",
+}
+MAX_STEPS_BY_TASK = {
     "glossary_anchoring": 1,
     "sandhi_resolution": 1,
     "samasa_classification": 1,
     "referential_coherence": 7,
 }
-TARGET_STEPS_PER_TASK = _env_int("TARGET_STEPS_PER_TASK", 10)
-TARGET_TOTAL_STEPS = TARGET_STEPS_PER_TASK * len(TASK_SEQUENCE)
-MAX_CURRICULUM_EPISODES = _env_int(
-    "MAX_CURRICULUM_EPISODES",
-    max(32, TARGET_TOTAL_STEPS * 2),
-)
-TEMPERATURE = _env_float("TEMPERATURE", 0.0)
-MAX_TOKENS = _env_int("MAX_TOKENS", 256)
-REQUEST_TIMEOUT = _env_int("REQUEST_TIMEOUT", 90)
-RETRY_WAIT = _env_int("RETRY_WAIT", 5)
-ENV_STARTUP_RETRIES = _env_int("ENV_STARTUP_RETRIES", 10)
-ENV_STARTUP_WAIT = _env_float("ENV_STARTUP_WAIT", 2.0)
 
 SYSTEM_PROMPT = """You are an expert Sanskrit manuscript interpreter.
 Read the passage, question, and candidate options carefully.
@@ -197,106 +86,37 @@ def _clamp_score(value: Optional[float]) -> float:
     return min(max(numeric, 0.0), 1.0)
 
 
-def _extract_chat_text(payload: dict) -> str:
-    choices = payload.get("choices") or []
-    if choices:
-        message = choices[0].get("message") or {}
-        content = message.get("content", "")
-
-        if isinstance(content, str):
-            return content.strip()
-
-        if isinstance(content, list):
-            chunks = []
-            for item in content:
-                if isinstance(item, dict) and isinstance(item.get("text"), str):
-                    chunks.append(item["text"])
-            return "".join(chunks).strip()
-
-        return str(content).strip()
-
-    result = payload.get("result")
-    if isinstance(result, dict):
-        response_text = result.get("response")
-        if isinstance(response_text, str):
-            return response_text.strip()
-
-    return ""
-
-
-def _parse_api_error_text(raw: str) -> str:
-    text = (raw or "").strip()
-    if not text:
-        return "unknown provider error"
-
-    try:
-        payload = json.loads(text)
-        if isinstance(payload, dict):
-            error_payload = payload.get("error")
-            if isinstance(error_payload, dict):
-                message = error_payload.get("message")
-                if isinstance(message, str) and message.strip():
-                    return message.strip()
-            if isinstance(error_payload, str) and error_payload.strip():
-                return error_payload.strip()
-
-            errors = payload.get("errors")
-            if isinstance(errors, list):
-                messages = []
-                for item in errors:
-                    if isinstance(item, dict):
-                        message = item.get("message")
-                        if isinstance(message, str) and message.strip():
-                            messages.append(message.strip())
-                if messages:
-                    return "; ".join(messages)
-    except json.JSONDecodeError:
-        pass
-
-    return _single_line(text)[:220] or "unknown provider error"
-
-
-def _select_api_token(base_url: str) -> str:
-    lowered = (base_url or "").lower()
-    if "cloudflare" in lowered:
-        return CLOUDFLARE_API_TOKEN or HF_TOKEN
-    if "huggingface" in lowered or "router" in lowered:
-        return HF_TOKEN or CLOUDFLARE_API_TOKEN
-    return HF_TOKEN or CLOUDFLARE_API_TOKEN
-
-
-def _llm_headers() -> dict:
-    headers = {"Content-Type": "application/json"}
-    token = _select_api_token(API_BASE_URL)
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
-
-
-def _normalize_env_url(raw_url: Optional[str]) -> str:
-    value = _single_line(raw_url).rstrip("/")
-    if not value:
+def _extract_completion_text(completion) -> str:
+    choices = getattr(completion, "choices", None) or []
+    if not choices:
         return ""
 
-    lowered = value.lower()
-    if "huggingface.co/spaces/" in lowered:
-        parsed = urllib.parse.urlparse(value)
-        path_parts = [part for part in parsed.path.split("/") if part]
-        if len(path_parts) >= 3 and path_parts[0].lower() == "spaces":
-            owner = path_parts[1].lower()
-            space_name = path_parts[2].lower()
-            return f"https://{owner}-{space_name}.hf.space"
+    content = getattr(choices[0].message, "content", "")
+    if isinstance(content, str):
+        return content.strip()
 
-    if not re.match(r"^[a-z][a-z0-9+.-]*://", value, flags=re.IGNORECASE):
-        if value.endswith(".hf.space"):
-            return f"https://{value}"
-        if value.startswith("localhost") or value.startswith("127.0.0.1"):
-            return f"http://{value}"
-        if re.match(r"^\d+\.\d+\.\d+\.\d+(?::\d+)?$", value):
-            return f"http://{value}"
-        return f"https://{value}"
+    if isinstance(content, list):
+        chunks = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                chunks.append(item["text"])
+                continue
 
-    return value
+            text = getattr(item, "text", None)
+            if isinstance(text, str):
+                chunks.append(text)
+        return "".join(chunks).strip()
+
+    return str(content or "").strip()
+
+
+def build_task_plan(task_id: str, episodes_per_task: int = EPISODES_PER_TASK) -> List[str]:
+    normalized_task_id = task_id if task_id in VALID_TASKS else TASK_SEQUENCE[0]
+    return [normalized_task_id] * max(1, episodes_per_task)
+
+
+def build_task_label(task_id: str) -> str:
+    return TASK_LABELS.get(task_id, task_id.replace("_", " "))
 
 
 def build_user_prompt(obs, rolling_memory: str) -> str:
@@ -359,175 +179,26 @@ def update_rolling_memory(rolling_memory: str, obs, selected_option: str) -> str
     return "\n".join(lines[-10:])
 
 
-def call_llm(system_prompt: str, user_prompt: str) -> str:
-    if not API_BASE_URL:
-        raise RuntimeError("API_BASE_URL is not configured")
+def call_llm(client: OpenAI, system_prompt: str, user_prompt: str) -> str:
+    if not HF_TOKEN:
+        raise RuntimeError("HF_TOKEN is not configured")
 
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
+    completion = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": TEMPERATURE,
-        "max_tokens": MAX_TOKENS,
-        "stream": False,
-    }
-
-    request_body = json.dumps(payload).encode("utf-8")
-
-    for attempt in range(4):
-        request = urllib.request.Request(
-            API_BASE_URL,
-            data=request_body,
-            headers=_llm_headers(),
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
-                body = response.read().decode("utf-8")
-                data = json.loads(body)
-                text = _extract_chat_text(data)
-                if text:
-                    return text
-                raise RuntimeError("empty model response")
-        except urllib.error.HTTPError as exc:
-            error_body = exc.read().decode("utf-8", errors="ignore")
-            parsed = _parse_api_error_text(error_body)
-            if exc.code in (429, 500, 502, 503, 504) and attempt < 3:
-                time.sleep(RETRY_WAIT * (2 ** attempt))
-                continue
-            raise RuntimeError(f"model request failed ({exc.code}): {parsed}")
-        except urllib.error.URLError as exc:
-            if attempt < 3:
-                time.sleep(RETRY_WAIT * (2 ** attempt))
-                continue
-            raise RuntimeError(f"model network error: {_single_line(str(exc.reason))}")
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"model returned non-JSON response: {exc}")
-
-    raise RuntimeError("model retries exhausted")
-
-
-def _hf_space_url_from_id(raw_space_id: Optional[str]) -> str:
-    value = _single_line(raw_space_id)
-    if not value:
-        return ""
-
-    if re.match(r"^[a-z][a-z0-9+.-]*://", value, flags=re.IGNORECASE):
-        return value
-
-    if "/" not in value:
-        return ""
-
-    owner, space_name = (part.strip().lower() for part in value.split("/", 1))
-    if not owner or not space_name:
-        return ""
-
-    return f"https://{owner}-{space_name}.hf.space"
-
-
-def _is_local_env_url(base_url: str) -> bool:
-    try:
-        hostname = (urllib.parse.urlparse(base_url).hostname or "").lower()
-    except ValueError:
-        return False
-
-    return hostname in {"localhost", "127.0.0.1", "::1"}
-
-
-def _normalized_env_urls(raw_candidates: List[Optional[str]]) -> List[str]:
-    candidates: List[str] = []
-    for raw_candidate in raw_candidates:
-        normalized = _normalize_env_url(raw_candidate)
-        if normalized and normalized not in candidates:
-            candidates.append(normalized)
-    return candidates
-
-
-def _build_env_url_candidates() -> List[str]:
-    explicit_space_candidates = _normalized_env_urls(
-        [
-            os.environ.get("HF_SPACE_URL"),
-            os.environ.get("SPACE_URL"),
-            os.environ.get("SPACE_HOST"),
-            _hf_space_url_from_id(os.environ.get("HF_SPACE_ID") or os.environ.get("SPACE_ID")),
-        ]
+        temperature=TEMPERATURE,
+        max_tokens=MAX_TOKENS,
+        stream=False,
+        timeout=REQUEST_TIMEOUT,
     )
 
-    configured_candidates = _normalized_env_urls(
-        [
-            os.environ.get("SANSKRIT_ENV_URL"),
-            os.environ.get("ENV_URL"),
-            os.environ.get("OPENENV_BASE_URL"),
-        ]
-    )
-
-    configured_space_candidates = [
-        base_url for base_url in configured_candidates if not _is_local_env_url(base_url)
-    ]
-    configured_local_candidates = [
-        base_url for base_url in configured_candidates if _is_local_env_url(base_url)
-    ]
-
-    default_space_candidates = _normalized_env_urls([DEFAULT_HF_SPACE_URL])
-    default_local_candidates = _normalized_env_urls(
-        [
-            f"http://127.0.0.1:{ENV_PORT}",
-            f"http://localhost:{ENV_PORT}",
-        ]
-    )
-
-    if ENV_TARGET == "local":
-        return _normalized_env_urls(
-            configured_local_candidates
-            + default_local_candidates
-            + explicit_space_candidates
-            + configured_space_candidates
-            + default_space_candidates
-        )
-
-    if ENV_TARGET == "auto":
-        return _normalized_env_urls(
-            configured_candidates
-            + explicit_space_candidates
-            + default_space_candidates
-            + default_local_candidates
-        )
-
-    return _normalized_env_urls(
-        explicit_space_candidates
-        + configured_space_candidates
-        + default_space_candidates
-        + configured_local_candidates
-        + default_local_candidates
-    )
-
-
-def _wait_for_env() -> str:
-    candidates = _build_env_url_candidates()
-    last_errors = {}
-
-    for attempt in range(ENV_STARTUP_RETRIES):
-        for base_url in candidates:
-            health_url = f"{base_url}/health"
-            try:
-                with urllib.request.urlopen(health_url, timeout=10) as response:
-                    if 200 <= getattr(response, "status", 200) < 500:
-                        return base_url
-            except Exception as exc:
-                last_errors[base_url] = _single_line(str(exc)) or "unknown error"
-
-        if attempt < ENV_STARTUP_RETRIES - 1:
-            time.sleep(ENV_STARTUP_WAIT)
-
-    error_summary = "; ".join(
-        f"{base_url}/health -> {error}"
-        for base_url, error in last_errors.items()
-    )
-    raise RuntimeError(
-        f"environment not reachable via configured URLs: {error_summary or 'unknown error'}"
-    )
+    text = _extract_completion_text(completion)
+    if text:
+        return text
+    raise RuntimeError("empty model response")
 
 
 def match_to_option(raw_answer: str, candidate_options: List[str]) -> str:
@@ -563,14 +234,14 @@ def match_to_option(raw_answer: str, candidate_options: List[str]) -> str:
     return candidate_options[0]
 
 
-def choose_action(obs, rolling_memory: str) -> Tuple[str, str, Optional[str]]:
+def choose_action(client: OpenAI, obs, rolling_memory: str) -> Tuple[str, str, Optional[str]]:
     candidate_options = getattr(obs, "candidate_options", []) or []
     if not candidate_options:
         raise RuntimeError("environment returned no candidate options")
 
     prompt = build_user_prompt(obs, rolling_memory)
     try:
-        raw_answer = call_llm(SYSTEM_PROMPT, prompt)
+        raw_answer = call_llm(client, SYSTEM_PROMPT, prompt)
         return match_to_option(raw_answer, candidate_options), raw_answer, None
     except Exception as exc:
         error = _single_line(str(exc)) or "model request failed"
@@ -614,44 +285,59 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
     )
 
 
-def run_episode(
-    env,
+async def create_env() -> SanskritEnv:
+    if LOCAL_IMAGE_NAME:
+        return await SanskritEnv.from_docker_image(LOCAL_IMAGE_NAME)
+
+    env = SanskritEnv(base_url=SPACE_BASE_URL)
+    await env.connect()
+    return env
+
+
+async def run_episode(
+    env: SanskritEnv,
+    client: OpenAI,
     task_id: str,
     seed: int,
     step_offset: int,
-    step_limit: int,
 ) -> Tuple[int, List[float], float, bool]:
     try:
-        result = env.reset(task_id=task_id, seed=seed)
-        observation = result.observation
+        result = await env.reset(task_id=task_id, seed=seed)
+    except asyncio.CancelledError:
+        _debug(f"env.reset cancelled for task {task_id}")
+        return 0, [], 0.0, False
     except Exception as exc:
         _debug(f"env.reset failed for task {task_id}: {_single_line(str(exc))}")
         return 0, [], 0.0, False
+
+    observation = result.observation
     rolling_memory = ""
-    episode_steps = 0
-    episode_rewards: List[float] = []
-    task_step_cap = TASK_MAX_STEPS.get(task_id, MAX_STEPS)
-    effective_step_limit = max(1, min(task_step_cap, step_limit))
+    rewards: List[float] = []
+    steps_taken = 0
 
-    while not getattr(observation, "done", False) and episode_steps < effective_step_limit:
-        current_observation = observation
-        global_step = step_offset + episode_steps + 1
+    for step in range(1, MAX_STEPS_BY_TASK[task_id] + 1):
+        if bool(result.done or getattr(observation, "done", False)):
+            break
 
-        selected_option, raw_answer, model_error = choose_action(current_observation, rolling_memory)
-        rolling_memory = update_rolling_memory(rolling_memory, current_observation, selected_option)
+        selected_option, raw_answer, model_error = choose_action(client, observation, rolling_memory)
+        rolling_memory = update_rolling_memory(rolling_memory, observation, selected_option)
+        global_step = step_offset + step
 
         try:
-            result = env.step(
+            result = await env.step(
                 ManuscriptAction(
                     selected_option=selected_option,
                     confidence=0.8,
                     reasoning=raw_answer or model_error or "",
                 )
             )
+        except asyncio.CancelledError:
+            steps_taken = step
+            log_step(global_step, selected_option, 0.0, True, "environment step cancelled")
+            break
         except Exception as exc:
-            step_error = _single_line(str(exc)) or "environment step failed"
-            log_step(global_step, selected_option, 0.0, True, step_error)
-            episode_steps += 1
+            steps_taken = step
+            log_step(global_step, selected_option, 0.0, True, _single_line(str(exc)) or "environment step failed")
             break
 
         observation = result.observation
@@ -659,8 +345,9 @@ def run_episode(
         if reward is None:
             reward = result.reward
         reward = float(reward if reward is not None else 0.0)
-        episode_rewards.append(reward)
-        episode_steps += 1
+
+        rewards.append(reward)
+        steps_taken = step
 
         done = bool(result.done or getattr(observation, "done", False))
         step_error = _extract_step_error(observation, model_error)
@@ -669,103 +356,101 @@ def run_episode(
         if done:
             break
 
-    episode_score = _clamp_score(getattr(observation, "cumulative_score", 0.0))
-    if episode_score == 0.0 and getattr(result, "reward", None) is not None:
-        episode_score = _clamp_score(result.reward)
+    score = _clamp_score(getattr(observation, "cumulative_score", 0.0))
+    if score == 0.0 and getattr(result, "reward", None) is not None:
+        score = _clamp_score(result.reward)
 
-    episode_success = bool(getattr(observation, "done", False)) and episode_score > 0.0
-    return episode_steps, episode_rewards, episode_score, episode_success
+    success = bool(result.done or getattr(observation, "done", False)) and score > 0.50
+    return steps_taken, rewards, score, success
 
 
-def main() -> None:
-    rewards: List[float] = []
-    steps_taken = 0
-    score = 0.0
-    success = False
-    env_url = ""
+def log_score_summary(task_scores: dict[str, List[float]]) -> None:
+    for task_id in TASK_SEQUENCE:
+        scores = task_scores.get(task_id, [])
+        if not scores:
+            continue
+        mean_score = sum(scores) / len(scores)
+        score_text = ",".join(f"{score:.2f}" for score in scores)
+        _debug(
+            f"scores task={task_id} label={build_task_label(task_id)} episodes={len(scores)} "
+            f"mean={mean_score:.4f} values={score_text}"
+        )
 
-    display_task_name = "all" if RUN_CURRICULUM else TASK_NAME
-    log_start(task=display_task_name, env=BENCHMARK_NAME, model=MODEL_NAME)
 
-    try:
-        env_url = _wait_for_env()
-        _debug(f"environment url: {env_url}")
+async def main() -> None:
+    client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN or "missing")
 
-        with SanskritEnv(base_url=env_url).sync() as env:
-            if RUN_CURRICULUM:
-                task_step_counts = {task_id: 0 for task_id in TASK_SEQUENCE}
-                task_weighted_scores = {task_id: 0.0 for task_id in TASK_SEQUENCE}
-                task_score_weights = {task_id: 0 for task_id in TASK_SEQUENCE}
-                task_pointer = 0
+    task_scores = {task_id: [] for task_id in TASK_SEQUENCE}
+    stop_requested = False
 
-                for episode_index in range(MAX_CURRICULUM_EPISODES):
-                    if all(
-                        task_step_counts[task_id] >= TARGET_STEPS_PER_TASK
-                        for task_id in TASK_SEQUENCE
-                    ):
-                        break
+    for task_index, task_id in enumerate(TASK_SEQUENCE):
+        env: Optional[SanskritEnv] = None
+        task_rewards: List[float] = []
+        task_episode_scores: List[float] = []
+        task_steps_taken = 0
+        task_success = False
+        task_score = 0.0
+        task_plan = build_task_plan(task_id)
 
-                    task_id = None
-                    for _ in range(len(TASK_SEQUENCE)):
-                        candidate_task = TASK_SEQUENCE[task_pointer % len(TASK_SEQUENCE)]
-                        task_pointer += 1
-                        if task_step_counts[candidate_task] < TARGET_STEPS_PER_TASK:
-                            task_id = candidate_task
-                            break
+        log_start(task=build_task_label(task_id), env=BENCHMARK, model=MODEL_NAME)
 
-                    if task_id is None:
-                        break
+        try:
+            env = await create_env()
 
-                    remaining_steps_for_task = TARGET_STEPS_PER_TASK - task_step_counts[task_id]
-                    episode_steps, episode_rewards, episode_score, _ = run_episode(
-                        env=env,
-                        task_id=task_id,
-                        seed=RANDOM_SEED + episode_index,
-                        step_offset=steps_taken,
-                        step_limit=remaining_steps_for_task,
-                    )
-
-                    if episode_steps <= 0:
-                        break
-
-                    steps_taken += episode_steps
-                    rewards.extend(episode_rewards)
-                    task_step_counts[task_id] += episode_steps
-                    task_weighted_scores[task_id] += episode_score * episode_steps
-                    task_score_weights[task_id] += episode_steps
-
-                task_scores = []
-                for task_id in TASK_SEQUENCE:
-                    if task_score_weights[task_id] > 0:
-                        task_scores.append(task_weighted_scores[task_id] / task_score_weights[task_id])
-
-                if task_scores:
-                    score = _clamp_score(sum(task_scores) / len(task_scores))
-                    success = all(
-                        task_step_counts[task_id] >= TARGET_STEPS_PER_TASK
-                        for task_id in TASK_SEQUENCE
-                    ) and score > 0.0
-            else:
-                episode_steps, episode_rewards, episode_score, episode_success = run_episode(
+            for episode_index, planned_task_id in enumerate(task_plan):
+                episode_steps, episode_rewards, episode_score, _ = await run_episode(
                     env=env,
-                    task_id=TASK_NAME,
-                    seed=RANDOM_SEED,
-                    step_offset=0,
-                    step_limit=MAX_STEPS,
+                    client=client,
+                    task_id=planned_task_id,
+                    seed=RANDOM_SEED + task_index * EPISODES_PER_TASK + episode_index,
+                    step_offset=task_steps_taken,
                 )
-                steps_taken = episode_steps
-                rewards.extend(episode_rewards)
-                score = episode_score
-                success = episode_success
+                task_steps_taken += episode_steps
+                task_rewards.extend(episode_rewards)
+                task_episode_scores.append(episode_score)
+                task_scores[task_id].append(episode_score)
 
-    except Exception as exc:
-        _debug(f"inference error: {_single_line(str(exc))}")
-        score = 0.0
-        success = False
+            if task_episode_scores:
+                task_score = sum(task_episode_scores) / len(task_episode_scores)
+            task_success = len(task_episode_scores) == len(task_plan) and task_score > 0.50
+            log_score_summary({task_id: task_episode_scores})
+        except asyncio.CancelledError:
+            _debug(f"task inference cancelled ({task_id})")
+            if task_episode_scores:
+                task_score = sum(task_episode_scores) / len(task_episode_scores)
+            task_success = False
+            stop_requested = True
+        except Exception as exc:
+            _debug(f"task inference error ({task_id}): {_single_line(str(exc))}")
+            if task_episode_scores:
+                task_score = sum(task_episode_scores) / len(task_episode_scores)
+            task_success = False
+        except BaseException as exc:
+            _debug(f"task inference interrupted ({task_id}): {_single_line(str(exc)) or type(exc).__name__}")
+            if task_episode_scores:
+                task_score = sum(task_episode_scores) / len(task_episode_scores)
+            task_success = False
+            stop_requested = True
+        finally:
+            if env is not None:
+                try:
+                    await env.close()
+                except BaseException as exc:
+                    _debug(f"env.close failed for task {task_id}: {_single_line(str(exc))}")
 
-    finally:
-        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+            log_end(
+                success=task_success,
+                steps=task_steps_taken,
+                score=task_score,
+                rewards=task_rewards,
+            )
+
+        if stop_requested:
+            break
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

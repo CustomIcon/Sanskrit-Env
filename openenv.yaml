@@ -22,22 +22,22 @@ tasks:
     difficulty: easy
     description: Select the correct domain-specific meaning of a Sanskrit technical term
     max_steps: 1
-    score_range: [0.0, 1.0]
+    score_range: [0.5, 0.95]
   - id: sandhi_resolution
     difficulty: medium
     description: Identify the correct phonological split of a Sanskrit compound word
     max_steps: 1
-    score_range: [0.0, 1.0]
+    score_range: [0.5, 0.95]
   - id: samasa_classification
     difficulty: medium
     description: Identify the grammatical type of a Sanskrit compound word (samasa) from six Paninian categories
     max_steps: 1
-    score_range: [0.0, 1.0]
+    score_range: [0.5, 0.95]
   - id: referential_coherence
     difficulty: hard
     description: Track pronouns and implicit subjects across a multi-verse Sanskrit passage
     max_steps: 7
-    score_range: [0.0, 1.0]
+    score_range: [0.5, 0.95]
 observation_space:
   type: structured
   fields:

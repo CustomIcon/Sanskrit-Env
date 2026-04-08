@@ -36,6 +36,8 @@ class SanskritEnvironment(Environment):
     """
 
     SUPPORTS_CONCURRENT_SESSIONS = True
+    MIN_EPISODE_SCORE = 0.50
+    MAX_EPISODE_SCORE = 0.95
 
     def __init__(self):
         self._sessions = {} # {session_id: session_dict}
@@ -52,6 +54,13 @@ class SanskritEnvironment(Environment):
         self._task2_data = self._load_json("task2_sandhi.json")
         self._task3_data = self._load_json("task3_coherence.json")
         self._task4_data = self._load_json("task4_samasa.json")
+
+    def _shape_episode_score(self, raw_score: float) -> float:
+        normalized = min(max(float(raw_score), 0.0), 1.0)
+        shaped = self.MIN_EPISODE_SCORE + normalized * (
+            self.MAX_EPISODE_SCORE - self.MIN_EPISODE_SCORE
+        )
+        return round(min(max(shaped, self.MIN_EPISODE_SCORE), self.MAX_EPISODE_SCORE), 4)
 
     def _load_json(self, filename: str) -> dict:
         path = DATA_DIR / filename
@@ -393,10 +402,11 @@ class SanskritEnvironment(Environment):
                 candidate_options=ep["candidate_options"],
             )
 
-            episode_score = self._coherence_grader.compute_episode_score(
+            raw_episode_score = self._coherence_grader.compute_episode_score(
                 final_reward=final_reward,
                 checkpoint_rewards=session["t3_checkpoint_rewards"],
             )
+            episode_score = self._shape_episode_score(raw_episode_score)
 
             state.correct_decisions += int(final_reward > 0)
             state.is_complete = True
@@ -603,14 +613,14 @@ class SanskritEnvironment(Environment):
             return 0.0
         if task_id == "glossary_anchoring":
             raw = correct * 1.0 + partial * 0.4
-            return round(min(raw / total, 1.0), 4)
+            return self._shape_episode_score(min(raw / total, 1.0))
         elif task_id == "sandhi_resolution":
             raw = correct * 1.0 + partial * 0.25
-            return round(min(raw / total, 1.0), 4)
+            return self._shape_episode_score(min(raw / total, 1.0))
         elif task_id == "samasa_classification":
             raw = correct * 1.0 + partial * 0.4
-            return round(min(raw / total, 1.0), 4)
-        return round(min(correct / total, 1.0), 4)
+            return self._shape_episode_score(min(raw / total, 1.0))
+        return self._shape_episode_score(min(correct / total, 1.0))
 
     def _compute_t3_partial_score(self, session: dict) -> float:
         cp_score = sum(session["t3_checkpoint_rewards"])

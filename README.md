@@ -185,8 +185,8 @@ Devanagari alongside its source passage and English context.
 | Correct final antecedent identification | `+0.70` |
 | Wrong checkpoint or final answer | `+0.00` |
 
-All episode scores are normalized to **0.0–1.0** before being returned as the
-final `reward` when `done=True`.
+All final episode scores are shaped into the **0.50–0.95** range before being
+returned as the final `reward` when `done=True`.
 
 ---
 
@@ -275,6 +275,24 @@ python baseline.py
 # Single task
 python baseline.py --task referential_coherence
 ```
+
+### Run inference.py
+
+```bash
+export HF_TOKEN=your_huggingface_token
+export API_BASE_URL=https://router.huggingface.co/v1
+export MODEL_NAME=Qwen/Qwen2.5-72B-Instruct
+
+# Optional: use this only when launching the env from a local Docker image.
+# export LOCAL_IMAGE_NAME=sanskrit-env:local
+
+python inference.py
+```
+
+`inference.py` defaults to the deployed HF Space for the environment connection.
+If `LOCAL_IMAGE_NAME` is set, it uses `SanskritEnv.from_docker_image(...)` instead.
+Each run evaluates 15 episodes for each of the four SanskritEnv tasks.
+Stdout is emitted as four separate START/STEP/END sections, one per task, and the END scores come directly from the environment's 0.50-0.95 scoring logic.
 
 ---
 
